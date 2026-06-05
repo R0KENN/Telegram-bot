@@ -7,7 +7,8 @@ from urllib.parse import urlparse
 from aiogram import Router, F
 from aiogram.types import (
     ChatJoinRequest, Message, CallbackQuery,
-    InlineKeyboardMarkup, InlineKeyboardButton, ChatMemberUpdated
+    InlineKeyboardMarkup, InlineKeyboardButton, ChatMemberUpdated,
+    ReactionTypeEmoji
 )
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -110,6 +111,30 @@ async def on_added_to_group(event: ChatMemberUpdated):
 
 
 # ============================================================
+#            АВТО-РЕАКЦИИ НА ПОСТЫ В КАНАЛЕ
+# ============================================================
+
+# Эмодзи, которым бот реагирует на каждый пост в канале.
+CHANNEL_REACTION = "🔥"
+
+
+@router.channel_post()
+async def auto_react_channel_post(message: Message):
+    # Реагируем только если для этого канала реакции включены в настройках.
+    if await db.get_setting(message.chat.id, "auto_reaction") != "1":
+        return
+    emoji = await db.get_setting(message.chat.id, "reaction_emoji") or CHANNEL_REACTION
+    try:
+        await message.bot.set_message_reaction(
+            chat_id=message.chat.id,
+            message_id=message.message_id,
+            reaction=[ReactionTypeEmoji(emoji=emoji)],
+        )
+    except Exception:
+        # Нет прав, эмодзи не разрешён в канале, сообщение удалено и т.п. — молча игнорируем.
+        pass
+
+# ============================================================
 #                       ЗАЯВКИ
 # ============================================================
 @router.chat_join_request()
@@ -192,6 +217,26 @@ def extract_domains(text):
             pass
     return domains
 
+def _utf16_len(s: str) -> int:
+    """Длина строки в UTF-16 code units — так Telegram считает offset/length."""
+    return len(s.encode("utf-16-le")) // 2
+
+
+def build_datetime_entity(prefix: str, placeholder: str, unix_ts: int,
+                          fmt: str = "dd.MM.yyyy HH:mm"):
+    """
+    Возвращает MessageEntity типа date_time для подстроки `placeholder`,
+    которая идёт сразу после `prefix` в тексте.
+    Telegram покажет время в часовом поясе каждого пользователя.
+    """
+    from aiogram.types import MessageEntity
+    return MessageEntity(
+        type="date_time",
+        offset=_utf16_len(prefix),
+        length=_utf16_len(placeholder),
+        unix_time=unix_ts,
+        date_time_format=fmt,
+    )
 
 # Приветствие новых участников в группе
 @router.message(F.new_chat_members)
@@ -488,6 +533,13 @@ async def cb_twf(c: CallbackQuery):
     await c.message.edit_reply_markup(reply_markup=await kb.mod_menu_kb(chat_id))
     await c.answer()
 
+@router.callback_query(F.data.startswith("treact:"))
+async def cb_treact(c: CallbackQuery):
+    chat_id = int(c.data.split(":")[1])
+    cur = await db.get_setting(chat_id, "auto_reaction")
+    await db.set_setting(chat_id, "auto_reaction", "0" if cur == "1" else "1")
+    await c.message.edit_reply_markup(reply_markup=await kb.chat_menu_kb(chat_id))
+    await c.answer("Авто-реакция " + ("включена" if cur != "1" else "выключена"))
 
 @router.callback_query(F.data.startswith("domains:"))
 async def cb_domains(c: CallbackQuery, state: FSMContext):

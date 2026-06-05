@@ -26,6 +26,8 @@ DEFAULTS = {
     "group_welcome_enabled": "0", # приветствие в группе
     "group_welcome_text": "Добро пожаловать, {name}! 👋",
     "group_welcome_ttl": "60",    # через сколько секунд удалить приветствие
+    "auto_reaction": "0",      # авто-реакция бота на посты в канале выключена по умолчанию
+    "reaction_emoji": "🔥",    # какой эмодзи ставить
 }
 
 if not BOT_TOKEN:

@@ -291,4 +291,27 @@ async def delete_banned_word(word_id, chat_id):
         await db.execute(
             "DELETE FROM banned_words WHERE id=? AND chat_id=?", (word_id, chat_id)
         )
+                await db.execute("""
+            CREATE TABLE IF NOT EXISTS topics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER, thread_id INTEGER, name TEXT
+            )
+        """)
         await db.commit()
+
+# ====== ТЕМЫ (forum topics) ======
+async def add_topic(chat_id, thread_id, name):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO topics (chat_id, thread_id, name) VALUES (?, ?, ?)",
+            (chat_id, thread_id, name)
+        )
+        await db.commit()
+
+
+async def get_topics(chat_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id, thread_id, name FROM topics WHERE chat_id=?", (chat_id,)
+        ) as cur:
+            return await cur.fetchall()
