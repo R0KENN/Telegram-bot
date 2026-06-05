@@ -37,10 +37,26 @@ async def init_db():
 
 async def register_channel(chat_id, title):
     async with aiosqlite.connect(DB_PATH) as db:
+        # Проверяем, есть ли уже такой канал
+        async with db.execute(
+            "SELECT 1 FROM channels WHERE chat_id=?", (chat_id,)
+        ) as cur:
+            exists = await cur.fetchone() is not None
+
+        # Сохраняем/обновляем название канала
         await db.execute(
             "INSERT OR REPLACE INTO channels (chat_id, title) VALUES (?, ?)",
             (chat_id, title)
         )
+
+        # Если канал новый — явно выключаем автоприём по умолчанию
+        if not exists:
+            await db.execute(
+                "INSERT OR IGNORE INTO settings (chat_id, key, value) "
+                "VALUES (?, 'auto_approve', '0')",
+                (chat_id,)
+            )
+
         await db.commit()
 
 
