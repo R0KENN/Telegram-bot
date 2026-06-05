@@ -200,5 +200,6 @@ async def reactions_menu_kb(chat_id):
         [InlineKeyboardButton(text=f"🎯 Эмодзи: {emoji}", callback_data=f"pickreact:{chat_id}")],
         [InlineKeyboardButton(text=f"⏱ Задержка: {delay_label}", callback_data=f"pickdelay:{chat_id}")],
         [InlineKeyboardButton(text="🔁 Реакции на старые посты", callback_data=f"reactall:{chat_id}")],
+        [InlineKeyboardButton(text="🧹 Снять все реакции бота", callback_data=f"clearall:{chat_id}")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"ch:{chat_id}")],
     ])

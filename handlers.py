@@ -158,10 +158,27 @@ async def auto_react_channel_post(message: Message):
 @router.message_reaction_count()
 async def on_reaction_count(event):
     from aiogram.types import ReactionTypeCustomEmoji
+    chat_id, message_id = event.chat.id, event.message_id
+    custom_id = None
     for r in event.reactions:
         if isinstance(r.type, ReactionTypeCustomEmoji):
-            _custom_reactions[(event.chat.id, event.message_id)] = r.type.custom_emoji_id
+            custom_id = r.type.custom_emoji_id
             break
+    if not custom_id:
+        return
+    _custom_reactions[(chat_id, message_id)] = custom_id
+
+    # Если авто-реакции включены и бот уже отреагировал (обычной) — заменим на кастомную
+    if await db.get_setting(chat_id, "auto_reaction") != "1":
+        return
+    if await db.is_reacted(chat_id, message_id):
+        try:
+            await event.bot.set_message_reaction(
+                chat_id=chat_id, message_id=message_id,
+                reaction=[ReactionTypeCustomEmoji(custom_emoji_id=custom_id)],
+            )
+        except Exception:
+            pass  # кастомная больше недоступна / нет прав — оставляем как было
 
 async def _delayed_react(bot, chat_id, message_id):
     delay = int(await db.get_setting(chat_id, "reaction_delay") or "180")
@@ -209,6 +226,31 @@ async def _reactall_worker(bot, chat_id, top_message_id, depth, emoji, notify_to
             pass
     finally:
         _reactall_running.discard(chat_id)  # снимаем флаг в любом случае
+
+async def _clearall_worker(bot, chat_id, notify_to):
+    """Снимает все реакции бота в канале по списку из reacted_posts."""
+    ids = await db.get_reacted_ids(chat_id)
+    removed = 0
+    try:
+        for mid in ids:
+            try:
+                await bot.set_message_reaction(
+                    chat_id=chat_id, message_id=mid, reaction=[]
+                )
+                await db.unmark_reacted(chat_id, mid)
+                removed += 1
+            except TelegramRetryAfter as e:
+                await asyncio.sleep(e.retry_after)
+            except Exception:
+                # сообщение удалено/недоступно — просто убираем из учёта
+                await db.unmark_reacted(chat_id, mid)
+            await asyncio.sleep(0.4)
+        try:
+            await bot.send_message(notify_to, f"✅ Снято реакций: {removed}.")
+        except Exception:
+            pass
+    finally:
+        _reactall_running.discard(chat_id)
 
 @router.message(Command("reactall"), F.chat.type == ChatType.PRIVATE)
 async def cmd_reactall(message: Message):
@@ -279,6 +321,35 @@ async def cb_reactall(c: CallbackQuery):
     asyncio.create_task(
         _reactall_worker(c.bot, chat_id, top, depth, emoji, c.from_user.id)
     )
+    await c.answer("Запущено")
+
+@router.callback_query(F.data.startswith("clearall:"))
+async def cb_clearall(c: CallbackQuery):
+    if not is_admin_id(c.from_user.id):
+        await c.answer()
+        return
+    chat_id = int(c.data.split(":")[1])
+    kb_confirm = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, снять все", callback_data=f"clearallok:{chat_id}")],
+        [InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"reactions:{chat_id}")],
+    ])
+    await c.message.edit_text(
+        "🧹 Снять все реакции бота в этом канале?\n\n"
+        "Бот уберёт свои реакции со всех постов, на которые реагировал.",
+        reply_markup=kb_confirm
+    )
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("clearallok:"))
+async def cb_clearall_ok(c: CallbackQuery):
+    chat_id = int(c.data.split(":")[1])
+    if chat_id in _reactall_running:
+        await c.answer("По этому каналу уже идёт операция. Дождись отчёта.", show_alert=True)
+        return
+    _reactall_running.add(chat_id)
+    await c.message.edit_text("⏳ Снимаю реакции. Пришлю отчёт по завершении.")
+    asyncio.create_task(_clearall_worker(c.bot, chat_id, c.from_user.id))
     await c.answer("Запущено")
 
 # ============================================================

@@ -386,3 +386,25 @@ async def delete_chat(chat_id):
             await db.execute(f"DELETE FROM {table} WHERE chat_id=?", (chat_id,))
         await db.execute("DELETE FROM chats WHERE chat_id=?", (chat_id,))
         await db.commit()
+
+async def get_reacted_ids(chat_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT message_id FROM reacted_posts WHERE chat_id=?", (chat_id,)
+        ) as cur:
+            return [r[0] for r in await cur.fetchall()]
+
+
+async def unmark_reacted(chat_id, message_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM reacted_posts WHERE chat_id=? AND message_id=?",
+            (chat_id, message_id)
+        )
+        await db.commit()
+
+
+async def clear_reacted(chat_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM reacted_posts WHERE chat_id=?", (chat_id,))
+        await db.commit()
