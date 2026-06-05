@@ -393,10 +393,6 @@ async def cmd_deltopic(message: Message):
             await db.delete_topic(db_id, message.chat.id)
     await message.reply("Тема удалена.")
 
-def _utf16_len(s: str) -> int:
-    """Длина строки в UTF-16 code units — так Telegram считает offset/length."""
-    return len(s.encode("utf-16-le")) // 2
-
 
 def extract_domains(text):
     domains = []
