@@ -26,14 +26,11 @@ async def chat_menu_kb(chat_id):
         [InlineKeyboardButton(text=toggle, callback_data=f"toggle:{chat_id}")],
     ]
     if ctype == "channel":
-        react_on = await db.get_setting(chat_id, "auto_reaction") == "1"
-        react_label = "🔥 Авто-реакция: ВКЛ" if react_on else "🔥 Авто-реакция: ВЫКЛ"
         rows += [
             [InlineKeyboardButton(text="⚙️ Приветствие (в личку)", callback_data=f"wmenu:{chat_id}")],
             [InlineKeyboardButton(text="📨 Рассылка", callback_data=f"bc:{chat_id}")],
             [InlineKeyboardButton(text="📝 Посты", callback_data=f"posts:{chat_id}")],
-            [InlineKeyboardButton(text=react_label, callback_data=f"treact:{chat_id}")],
-            [InlineKeyboardButton(text="🔁 Реакции на старые посты", callback_data=f"reactall:{chat_id}")],
+            [InlineKeyboardButton(text="🔥 Реакции", callback_data=f"reactions:{chat_id}")],
         ]
     else:  # группа
         rows += [
@@ -144,4 +141,64 @@ def skip_kb(chat_id):
 def back_kb(target):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⬅️ Назад", callback_data=target)]
+    ])
+# Популярные разрешённые эмодзи для выбора
+REACTION_CHOICES = ["👍", "❤", "🔥", "🎉", "👏", "😁", "🤩", "🙏", "👌", "🤝", "💯", "⚡"]
+
+
+async def reaction_pick_kb(chat_id):
+    current = await db.get_setting(chat_id, "reaction_emoji") or "🔥"
+    rows, line = [], []
+    for emoji in REACTION_CHOICES:
+        mark = "✅" if emoji == current else ""
+        line.append(InlineKeyboardButton(
+            text=f"{mark}{emoji}", callback_data=f"setreact:{chat_id}:{emoji}"
+        ))
+        if len(line) == 4:
+            rows.append(line)
+            line = []
+    if line:
+        rows.append(line)
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"reactions:{chat_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+# Варианты задержки: подпись -> секунды
+REACTION_DELAYS = [
+    ("Сразу", 0),
+    ("1 мин", 60),
+    ("3 мин", 180),
+    ("5 мин", 300),
+    ("10 мин", 600),
+    ("30 мин", 1800),
+]
+
+
+async def reaction_delay_kb(chat_id):
+    current = await db.get_setting(chat_id, "reaction_delay") or "180"
+    rows, line = [], []
+    for label, secs in REACTION_DELAYS:
+        mark = "✅ " if str(secs) == current else ""
+        line.append(InlineKeyboardButton(
+            text=f"{mark}{label}", callback_data=f"setdelay:{chat_id}:{secs}"
+        ))
+        if len(line) == 3:
+            rows.append(line)
+            line = []
+    if line:
+        rows.append(line)
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"reactions:{chat_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+async def reactions_menu_kb(chat_id):
+    react_on = await db.get_setting(chat_id, "auto_reaction") == "1"
+    toggle = "🟢 Авто-реакция: ВКЛ" if react_on else "🔴 Авто-реакция: ВЫКЛ"
+    emoji = await db.get_setting(chat_id, "reaction_emoji") or "🔥"
+    delay = int(await db.get_setting(chat_id, "reaction_delay") or "180")
+    delay_label = "сразу" if delay == 0 else (f"{delay // 60} мин" if delay >= 60 else f"{delay} сек")
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=toggle, callback_data=f"treact:{chat_id}")],
+        [InlineKeyboardButton(text=f"🎯 Эмодзи: {emoji}", callback_data=f"pickreact:{chat_id}")],
+        [InlineKeyboardButton(text=f"⏱ Задержка: {delay_label}", callback_data=f"pickdelay:{chat_id}")],
+        [InlineKeyboardButton(text="🔁 Реакции на старые посты", callback_data=f"reactall:{chat_id}")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"ch:{chat_id}")],
     ])

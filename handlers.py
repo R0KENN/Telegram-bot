@@ -21,7 +21,8 @@ import keyboards as kb
 from config import ADMIN_ID, TZ, TIMEZONE_OFFSET, BROADCAST_PAUSE
 
 router = Router()
-
+# Подхваченные кастомные реакции по постам: {(chat_id, message_id): custom_emoji_id}
+_custom_reactions: dict[tuple[int, int], str] = {}
 # Каналы, по которым прямо сейчас идёт перебор /reactall (защита от повторного запуска)
 _reactall_running: set[int] = set()
 
@@ -151,24 +152,38 @@ async def auto_react_channel_post(message: Message):
     chat_id = message.chat.id
     if await db.get_setting(chat_id, "auto_reaction") != "1":
         return
+    # ставим реакцию не сразу, а через задержку
+    asyncio.create_task(_delayed_react(message.bot, chat_id, message.message_id))
+
+@router.message_reaction_count()
+async def on_reaction_count(event):
+    from aiogram.types import ReactionTypeCustomEmoji
+    for r in event.reactions:
+        if isinstance(r.type, ReactionTypeCustomEmoji):
+            _custom_reactions[(event.chat.id, event.message_id)] = r.type.custom_emoji_id
+            break
+
+async def _delayed_react(bot, chat_id, message_id):
+    delay = int(await db.get_setting(chat_id, "reaction_delay") or "180")
+    if delay > 0:
+        await asyncio.sleep(delay)
+    if await db.is_reacted(chat_id, message_id):
+        return
+    # пробуем подхватить кастомную реакцию, которую уже поставили подписчики
+    custom_id = _custom_reactions.get((chat_id, message_id))
+    if custom_id:
+        try:
+            from aiogram.types import ReactionTypeCustomEmoji
+            await bot.set_message_reaction(
+                chat_id=chat_id, message_id=message_id,
+                reaction=[ReactionTypeCustomEmoji(custom_emoji_id=custom_id)],
+            )
+            await db.mark_reacted(chat_id, message_id)
+            return
+        except Exception:
+            pass  # не вышло — поставим обычную ниже
     emoji = await db.get_setting(chat_id, "reaction_emoji") or "🔥"
-
-    # 1) реагируем на текущий пост
-    if not await db.is_reacted(chat_id, message.message_id):
-        await _put_reaction(message.bot, chat_id, message.message_id, emoji)
-
-    # 2) "догоняем" пропущенные посты, если бот был offline
-    last = await db.last_reacted_id(chat_id)
-    if last and message.message_id - last > 1:
-        # проходим только разумный диапазон, чтобы не упереться в лимиты
-        start = max(last + 1, message.message_id - 50)
-        for mid in range(start, message.message_id):
-            if await db.is_reacted(chat_id, mid):
-                continue
-            await _put_reaction(message.bot, chat_id, mid, emoji)
-            await asyncio.sleep(0.3)  # бережём лимиты
-
-
+    await _put_reaction(bot, chat_id, message_id, emoji)
 
 async def _reactall_worker(bot, chat_id, top_message_id, depth, emoji, notify_to):
     """Фоновый перебор: ставит реакции на последние `depth` постов вниз от top_message_id."""
@@ -751,13 +766,57 @@ async def cb_twf(c: CallbackQuery):
     await c.message.edit_reply_markup(reply_markup=await kb.mod_menu_kb(chat_id))
     await c.answer()
 
+@router.callback_query(F.data.startswith("reactions:"))
+async def cb_reactions(c: CallbackQuery):
+    chat_id = int(c.data.split(":")[1])
+    await c.message.edit_text(
+        "🔥 <b>Реакции на посты канала</b>",
+        reply_markup=await kb.reactions_menu_kb(chat_id)
+    )
+    await c.answer()
+
 @router.callback_query(F.data.startswith("treact:"))
 async def cb_treact(c: CallbackQuery):
     chat_id = int(c.data.split(":")[1])
     cur = await db.get_setting(chat_id, "auto_reaction")
     await db.set_setting(chat_id, "auto_reaction", "0" if cur == "1" else "1")
-    await c.message.edit_reply_markup(reply_markup=await kb.chat_menu_kb(chat_id))
+    await c.message.edit_reply_markup(reply_markup=await kb.reactions_menu_kb(chat_id))
     await c.answer("Авто-реакция " + ("включена" if cur != "1" else "выключена"))
+
+@router.callback_query(F.data.startswith("pickreact:"))
+async def cb_pickreact(c: CallbackQuery):
+    chat_id = int(c.data.split(":")[1])
+    await c.message.edit_text(
+        "🎯 <b>Выбери реакцию</b>, которую бот будет ставить на посты:",
+        reply_markup=await kb.reaction_pick_kb(chat_id)
+    )
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("setreact:"))
+async def cb_setreact(c: CallbackQuery):
+    _, chat_id, emoji = c.data.split(":")
+    await db.set_setting(int(chat_id), "reaction_emoji", emoji)
+    await c.message.edit_reply_markup(reply_markup=await kb.reaction_pick_kb(int(chat_id)))
+    await c.answer(f"Реакция: {emoji}")
+
+@router.callback_query(F.data.startswith("pickdelay:"))
+async def cb_pickdelay(c: CallbackQuery):
+    chat_id = int(c.data.split(":")[1])
+    await c.message.edit_text(
+        "⏱ <b>Через сколько ставить реакцию</b> после публикации поста?",
+        reply_markup=await kb.reaction_delay_kb(chat_id)
+    )
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("setdelay:"))
+async def cb_setdelay(c: CallbackQuery):
+    _, chat_id, secs = c.data.split(":")
+    await db.set_setting(int(chat_id), "reaction_delay", secs)
+    await c.message.edit_reply_markup(reply_markup=await kb.reaction_delay_kb(int(chat_id)))
+    label = "сразу" if secs == "0" else f"{int(secs) // 60} мин" if int(secs) >= 60 else f"{secs} сек"
+    await c.answer(f"Задержка: {label}")
 
 @router.callback_query(F.data.startswith("domains:"))
 async def cb_domains(c: CallbackQuery, state: FSMContext):

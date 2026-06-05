@@ -10,6 +10,7 @@ from config import BOT_TOKEN
 import database as db
 from handlers import router
 from scheduler import scheduler
+from commands import setup_commands
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -22,6 +23,7 @@ async def main():
 
     await db.init_db()
     await bot.delete_webhook(drop_pending_updates=False)
+    await setup_commands(bot)
     asyncio.create_task(scheduler(bot))
 
     logger.info("Бот запущен")
