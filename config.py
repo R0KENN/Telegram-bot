@@ -14,11 +14,18 @@ BROADCAST_PAUSE = 0.1
 TZ = timezone(timedelta(hours=TIMEZONE_OFFSET))
 
 DEFAULTS = {
-    "auto_approve": "1",
-    "welcome_text": "Привет! 👋 Рады видеть тебя в нашем сообществе.\n\n"
-                    "Загляни в <b>закреплённые сообщения</b>.",
+    "auto_approve": "0",          # автоприём выключен по умолчанию
+    # --- приветствие в личку (каналы) ---
+    "welcome_enabled": "1",
+    "welcome_text": "Привет! 👋 Рады видеть тебя в нашем сообществе.",
     "welcome_delay": "120",
-    "rules_url": "https://t.me/",
+    # кнопки приветствия хранятся отдельной таблицей
+    # --- модерация групп ---
+    "del_links": "0",             # удаление ссылок от не-админов
+    "word_filter": "0",           # фильтр запрещённых слов
+    "group_welcome_enabled": "0", # приветствие в группе
+    "group_welcome_text": "Добро пожаловать, {name}! 👋",
+    "group_welcome_ttl": "60",    # через сколько секунд удалить приветствие
 }
 
 if not BOT_TOKEN:

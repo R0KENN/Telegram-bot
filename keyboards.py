@@ -1,52 +1,129 @@
+from datetime import datetime
+
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 import database as db
+from config import TZ
 
 
-async def channels_kb():
+async def chats_kb():
     rows = []
-    for chat_id, title in await db.get_channels():
-        rows.append([InlineKeyboardButton(text=f"📢 {title}", callback_data=f"ch:{chat_id}")])
-    rows.append([InlineKeyboardButton(text="➕ Добавить канал", callback_data="addch")])
+    for chat_id, title, ctype in await db.get_chats():
+        icon = "📢" if ctype == "channel" else "👥"
+        rows.append([InlineKeyboardButton(text=f"{icon} {title}", callback_data=f"ch:{chat_id}")])
+    rows.append([InlineKeyboardButton(text="➕ Добавить канал/группу", callback_data="addch")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def channel_menu_kb(chat_id):
+async def chat_menu_kb(chat_id):
+    chat = await db.get_chat(chat_id)
+    ctype = chat[2] if chat else "channel"
     auto_on = await db.is_auto_approve(chat_id)
     toggle = "🟢 Автоприём: ВКЛ" if auto_on else "🔴 Автоприём: ВЫКЛ"
-    return InlineKeyboardMarkup(inline_keyboard=[
+    rows = [
         [InlineKeyboardButton(text="📊 Статистика", callback_data=f"stats:{chat_id}"),
          InlineKeyboardButton(text="🕓 Последние", callback_data=f"last:{chat_id}")],
         [InlineKeyboardButton(text=toggle, callback_data=f"toggle:{chat_id}")],
-        [InlineKeyboardButton(text="⚙️ Приветствие", callback_data=f"wmenu:{chat_id}")],
-        [InlineKeyboardButton(text="📨 Рассылка", callback_data=f"bc:{chat_id}")],
-        [InlineKeyboardButton(text="📝 Посты", callback_data=f"posts:{chat_id}")],
+    ]
+    if ctype == "channel":
+        rows += [
+            [InlineKeyboardButton(text="⚙️ Приветствие (в личку)", callback_data=f"wmenu:{chat_id}")],
+            [InlineKeyboardButton(text="📨 Рассылка", callback_data=f"bc:{chat_id}")],
+            [InlineKeyboardButton(text="📝 Посты", callback_data=f"posts:{chat_id}")],
+        ]
+    else:  # группа
+        rows += [
+            [InlineKeyboardButton(text="🛡 Модерация", callback_data=f"mod:{chat_id}")],
+            [InlineKeyboardButton(text="👋 Приветствие в группе", callback_data=f"gw:{chat_id}")],
+        ]
+    rows += [
         [InlineKeyboardButton(text="♻️ Сбросить настройки", callback_data=f"reset:{chat_id}")],
-        [InlineKeyboardButton(text="⬅️ К списку каналов", callback_data="channels")],
-    ])
+        [InlineKeyboardButton(text="⬅️ К списку", callback_data="chats")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def welcome_menu_kb(chat_id):
+# --- приветствие в личку (каналы) ---
+async def welcome_menu_kb(chat_id):
+    enabled = await db.get_setting(chat_id, "welcome_enabled") == "1"
+    toggle = "🟢 Приветствие: ВКЛ" if enabled else "🔴 Приветствие: ВЫКЛ"
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=toggle, callback_data=f"wtoggle:{chat_id}")],
         [InlineKeyboardButton(text="✏️ Текст", callback_data=f"st:{chat_id}")],
         [InlineKeyboardButton(text="⏱ Задержка", callback_data=f"sd:{chat_id}")],
-        [InlineKeyboardButton(text="🔗 Ссылка на правила", callback_data=f"sr:{chat_id}")],
+        [InlineKeyboardButton(text="🔘 Кнопки", callback_data=f"wbtns:{chat_id}")],
         [InlineKeyboardButton(text="👁 Проверить", callback_data=f"show:{chat_id}")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"ch:{chat_id}")],
     ])
 
 
+async def welcome_buttons_kb(chat_id):
+    rows = []
+    for bid, text, url in await db.get_welcome_buttons(chat_id):
+        rows.append([InlineKeyboardButton(
+            text=f"🗑 {text}", callback_data=f"delwbtn:{chat_id}:{bid}"
+        )])
+    buttons = await db.get_welcome_buttons(chat_id)
+    if len(buttons) < 4:
+        rows.append([InlineKeyboardButton(text="➕ Добавить кнопку", callback_data=f"addwbtn:{chat_id}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"wmenu:{chat_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# --- модерация групп ---
+async def mod_menu_kb(chat_id):
+    del_links = await db.get_setting(chat_id, "del_links") == "1"
+    word_filter = await db.get_setting(chat_id, "word_filter") == "1"
+    t1 = "🟢 Удалять ссылки: ВКЛ" if del_links else "🔴 Удалять ссылки: ВЫКЛ"
+    t2 = "🟢 Фильтр слов: ВКЛ" if word_filter else "🔴 Фильтр слов: ВЫКЛ"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=t1, callback_data=f"tdl:{chat_id}")],
+        [InlineKeyboardButton(text="🌐 Разрешённые домены", callback_data=f"domains:{chat_id}")],
+        [InlineKeyboardButton(text=t2, callback_data=f"twf:{chat_id}")],
+        [InlineKeyboardButton(text="🚫 Запрещённые слова", callback_data=f"words:{chat_id}")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"ch:{chat_id}")],
+    ])
+
+
+async def domains_kb(chat_id):
+    rows = []
+    for did, domain in await db.get_allowed_domains(chat_id):
+        rows.append([InlineKeyboardButton(text=f"🗑 {domain}", callback_data=f"deldom:{chat_id}:{did}")])
+    rows.append([InlineKeyboardButton(text="➕ Добавить домен", callback_data=f"adddom:{chat_id}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"mod:{chat_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def words_kb(chat_id):
+    rows = []
+    for wid, word in await db.get_banned_words(chat_id):
+        rows.append([InlineKeyboardButton(text=f"🗑 {word}", callback_data=f"delword:{chat_id}:{wid}")])
+    rows.append([InlineKeyboardButton(text="➕ Добавить слово", callback_data=f"addword:{chat_id}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"mod:{chat_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# --- приветствие в группе ---
+async def group_welcome_kb(chat_id):
+    enabled = await db.get_setting(chat_id, "group_welcome_enabled") == "1"
+    toggle = "🟢 Приветствие: ВКЛ" if enabled else "🔴 Приветствие: ВЫКЛ"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=toggle, callback_data=f"gwtoggle:{chat_id}")],
+        [InlineKeyboardButton(text="✏️ Текст", callback_data=f"gwtext:{chat_id}")],
+        [InlineKeyboardButton(text="⏱ Автоудаление (сек)", callback_data=f"gwttl:{chat_id}")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"ch:{chat_id}")],
+    ])
+
+
+# --- посты ---
 async def posts_menu_kb(chat_id):
-    from config import TZ
-    from datetime import datetime
-    rows = [[InlineKeyboardButton(text="➕ Новый отложенный пост",
-                                  callback_data=f"newpost:{chat_id}")]]
+    rows = [[InlineKeyboardButton(text="➕ Новый отложенный пост", callback_data=f"newpost:{chat_id}")]]
     for pid, text, publish_at in await db.get_pending_posts(chat_id):
         when = datetime.fromtimestamp(publish_at, TZ).strftime("%d.%m %H:%M")
         preview = (text[:20] + "…") if len(text) > 20 else text
-        preview = preview.replace("\n", " ")
         rows.append([InlineKeyboardButton(
-            text=f"🗑 {when} | {preview}", callback_data=f"delpost:{chat_id}:{pid}"
+            text=f"🗑 {when} | {preview}".replace("\n", " "),
+            callback_data=f"delpost:{chat_id}:{pid}"
         )])
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"ch:{chat_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
