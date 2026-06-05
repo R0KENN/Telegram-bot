@@ -326,7 +326,7 @@ async def delete_banned_word(word_id, chat_id):
         await db.execute(
             "DELETE FROM banned_words WHERE id=? AND chat_id=?", (word_id, chat_id)
         )
-                await db.execute("""
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS topics (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 chat_id INTEGER, thread_id INTEGER, name TEXT
