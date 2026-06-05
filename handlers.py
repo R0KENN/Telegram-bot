@@ -3,6 +3,7 @@ import re
 import time
 from datetime import datetime
 from urllib.parse import urlparse
+from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest
 
 from aiogram import Router, F
 from aiogram.types import (
@@ -11,6 +12,7 @@ from aiogram.types import (
     ReactionTypeEmoji
 )
 from aiogram.filters import Command
+from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.enums import ChatType
@@ -113,26 +115,109 @@ async def on_added_to_group(event: ChatMemberUpdated):
 # ============================================================
 #            АВТО-РЕАКЦИИ НА ПОСТЫ В КАНАЛЕ
 # ============================================================
-
-# Эмодзи, которым бот реагирует на каждый пост в канале.
-CHANNEL_REACTION = "🔥"
+async def _put_reaction(bot, chat_id, message_id, emoji):
+    """Ставит реакцию и помечает в базе. Возвращает True при успехе."""
+    try:
+        await bot.set_message_reaction(
+            chat_id=chat_id,
+            message_id=message_id,
+            reaction=[ReactionTypeEmoji(emoji=emoji)],
+        )
+        await db.mark_reacted(chat_id, message_id)
+        return True
+    except TelegramRetryAfter as e:
+        await asyncio.sleep(e.retry_after)
+        return False
+    except Exception:
+        # удалённое/сервисное/несуществующее сообщение или нет прав
+        return False
 
 
 @router.channel_post()
 async def auto_react_channel_post(message: Message):
-    # Реагируем только если для этого канала реакции включены в настройках.
-    if await db.get_setting(message.chat.id, "auto_reaction") != "1":
+    chat_id = message.chat.id
+    if await db.get_setting(chat_id, "auto_reaction") != "1":
         return
-    emoji = await db.get_setting(message.chat.id, "reaction_emoji") or CHANNEL_REACTION
+    emoji = await db.get_setting(chat_id, "reaction_emoji") or "🔥"
+
+    # 1) реагируем на текущий пост
+    if not await db.is_reacted(chat_id, message.message_id):
+        await _put_reaction(message.bot, chat_id, message.message_id, emoji)
+
+    # 2) "догоняем" пропущенные посты, если бот был offline
+    last = await db.last_reacted_id(chat_id)
+    if last and message.message_id - last > 1:
+        # проходим только разумный диапазон, чтобы не упереться в лимиты
+        start = max(last + 1, message.message_id - 50)
+        for mid in range(start, message.message_id):
+            if await db.is_reacted(chat_id, mid):
+                continue
+            await _put_reaction(message.bot, chat_id, mid, emoji)
+            await asyncio.sleep(0.3)  # бережём лимиты
+
+
+
+async def _reactall_worker(bot, chat_id, top_message_id, depth, emoji, notify_to):
+    """Фоновый перебор: ставит реакции на последние `depth` постов вниз от top_message_id."""
+    done = 0          # успешно поставлено реакций
+    skipped = 0       # уже были отреагированы
+    start = max(1, top_message_id - depth + 1)
+    for mid in range(top_message_id, start - 1, -1):
+        if await db.is_reacted(chat_id, mid):
+            skipped += 1
+            continue
+        ok = await _put_reaction(bot, chat_id, mid, emoji)
+        if ok:
+            done += 1
+        await asyncio.sleep(0.4)  # бережём лимиты Telegram
     try:
-        await message.bot.set_message_reaction(
-            chat_id=message.chat.id,
-            message_id=message.message_id,
-            reaction=[ReactionTypeEmoji(emoji=emoji)],
+        await bot.send_message(
+            notify_to,
+            f"✅ Готово. Поставлено реакций: {done}, "
+            f"уже были: {skipped}, диапазон: {start}–{top_message_id}."
         )
     except Exception:
-        # Нет прав, эмодзи не разрешён в канале, сообщение удалено и т.п. — молча игнорируем.
         pass
+
+
+
+@router.message(Command("reactall"), F.chat.type == ChatType.PRIVATE)
+async def cmd_reactall(message: Message):
+    if not is_admin_id(message.from_user.id):
+        return
+    parts = message.text.split()
+    if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
+        await message.answer(
+            "Использование: <code>/reactall &lt;chat_id&gt; [глубина]</code>\n"
+            "Пример: <code>/reactall -1001234567890 500</code>\n\n"
+            "chat_id канала можно увидеть в /menu (или это id из списка чатов).\n"
+            "Глубина по умолчанию 500, максимум 2000."
+        )
+        return
+
+    chat_id = int(parts[1])
+    depth = 500
+    if len(parts) >= 3 and parts[2].isdigit():
+        depth = max(1, min(int(parts[2]), 2000))  # ограничиваем 1..2000
+
+    # Бот должен знать "верхний" message_id канала. Берём последний, на который реагировали,
+    # либо просим переслать свежий пост, если истории ещё нет.
+    top = await db.last_reacted_id(chat_id)
+    if not top:
+        await message.answer(
+            "Не знаю последний пост этого канала. Сначала опубликуй любой новый пост "
+            "(бот его отметит), потом запусти /reactall ещё раз."
+        )
+        return
+
+    emoji = await db.get_setting(chat_id, "reaction_emoji") or "🔥"
+    await message.answer(
+        f"⏳ Запускаю перебор {depth} постов вниз от id {top}. "
+        f"Это займёт примерно {int(depth * 0.4)} сек. Пришлю отчёт по завершении."
+    )
+    asyncio.create_task(
+        _reactall_worker(message.bot, chat_id, top, depth, emoji, message.from_user.id)
+    )
 
 # ============================================================
 #                       ЗАЯВКИ
@@ -197,6 +282,87 @@ async def is_user_admin(bot, chat_id, user_id):
         return m.status in ("administrator", "creator")
     except Exception:
         return False
+
+
+
+# ============================================================
+#                   ТЕМЫ ФОРУМА (в супергруппах)
+# ============================================================
+@router.message(Command("newtopic"), F.chat.type == "supergroup")
+async def cmd_newtopic(message: Message):
+    if not await is_user_admin(message.bot, message.chat.id, message.from_user.id):
+        return
+    name = message.text.removeprefix("/newtopic").strip()
+    if not name:
+        await message.reply("Использование: /newtopic Название темы")
+        return
+    try:
+        topic = await message.bot.create_forum_topic(chat_id=message.chat.id, name=name)
+        await db.add_topic(message.chat.id, topic.message_thread_id, name)
+        await message.bot.send_message(
+            message.chat.id,
+            f"Тема «{name}» создана 🎉",
+            message_thread_id=topic.message_thread_id,
+        )
+    except Exception:
+        await message.reply(
+            "Не удалось создать тему. Проверь, что в группе включён режим тем "
+            "и у бота есть право «Управление темами»."
+        )
+
+
+@router.message(Command("topics"), F.chat.type == "supergroup")
+async def cmd_topics(message: Message):
+    if not await is_user_admin(message.bot, message.chat.id, message.from_user.id):
+        return
+    rows = await db.get_topics(message.chat.id)
+    if not rows:
+        await message.reply("Бот ещё не создавал тем в этой группе.")
+        return
+    lines = ["<b>Темы, созданные ботом:</b>\n"]
+    for _id, thread_id, name in rows:
+        lines.append(f"• {name} (id {thread_id})")
+    await message.reply("\n".join(lines))
+
+
+@router.message(Command("deltopic"), F.chat.type == "supergroup")
+async def cmd_deltopic(message: Message):
+    if not await is_user_admin(message.bot, message.chat.id, message.from_user.id):
+        return
+    arg = message.text.removeprefix("/deltopic").strip()
+    if not arg.isdigit():
+        await message.reply("Использование: /deltopic <id темы> (id смотри в /topics)")
+        return
+    thread_id = int(arg)
+    try:
+        await message.bot.delete_forum_topic(
+            chat_id=message.chat.id, message_thread_id=thread_id
+        )
+    except Exception:
+        await message.reply("Не удалось удалить тему в Telegram (возможно, уже удалена).")
+    # из базы убираем в любом случае
+    for db_id, t_id, _name in await db.get_topics(message.chat.id):
+        if t_id == thread_id:
+            await db.delete_topic(db_id, message.chat.id)
+    await message.reply("Тема удалена.")
+
+def _utf16_len(s: str) -> int:
+    """Длина строки в UTF-16 code units — так Telegram считает offset/length."""
+    return len(s.encode("utf-16-le")) // 2
+
+
+def build_datetime_entity(prefix: str, placeholder: str, unix_ts: int,
+                          fmt: str = "dd.MM.yyyy HH:mm"):
+    """MessageEntity типа date_time: Telegram покажет время в локали пользователя."""
+    from aiogram.types import MessageEntity
+    return MessageEntity(
+        type="date_time",
+        offset=_utf16_len(prefix),
+        length=_utf16_len(placeholder),
+        unix_time=unix_ts,
+        date_time_format=fmt,
+    )
+
 
 
 def extract_domains(text):
@@ -728,15 +894,35 @@ async def in_broadcast(message: Message, state: FSMContext):
         return
     await message.answer(f"Рассылка по {len(ids)} получателям...")
     sent, failed = 0, 0
+    dead = []  # кто заблокировал бота — удалим из базы
     for uid in ids:
         try:
             await message.bot.send_message(uid, text)
             sent += 1
-        except Exception:
+        except TelegramRetryAfter as e:
+            # Telegram просит подождать — ждём и повторяем этого же получателя
+            await asyncio.sleep(e.retry_after)
+            try:
+                await message.bot.send_message(uid, text)
+                sent += 1
+            except Exception:
+                failed += 1
+        except TelegramForbiddenError:
+            # пользователь заблокировал бота
+            dead.append(uid)
+            failed += 1
+        except TelegramBadRequest:
             failed += 1
         await asyncio.sleep(BROADCAST_PAUSE)
-    await message.answer(f"📨 Готово. Доставлено: {sent}, нет: {failed}",
-                         reply_markup=await kb.chat_menu_kb(cid))
+
+    if dead:
+        await db.remove_members(cid, dead)
+
+    await message.answer(
+        f"📨 Готово. Доставлено: {sent}, не доставлено: {failed}.\n"
+        f"Удалено заблокировавших: {len(dead)}.",
+        reply_markup=await kb.chat_menu_kb(cid)
+    )
 
 
 @router.callback_query(F.data.startswith("posts:"))
@@ -816,10 +1002,18 @@ async def in_post_time(message: Message, state: FSMContext):
         return
     data = await state.get_data()
     cid = data["chat_id"]
-    await db.add_post(cid, data["post_text"], data.get("btn_text"), data.get("btn_url"), pub)
     await state.clear()
-    await message.answer(f"✅ Запланировано на {dt.strftime('%d.%m.%Y %H:%M')}.",
-                         reply_markup=await kb.posts_menu_kb(cid))
+    prefix = "✅ Запланировано на "
+    placeholder = "—"
+    full_text = prefix + placeholder + "."
+    try:
+        entity = build_datetime_entity(prefix, placeholder, pub)
+        await message.answer(full_text, entities=[entity],
+                             reply_markup=await kb.posts_menu_kb(cid))
+    except Exception:
+        # Fallback, если версия aiogram/клиента не поддерживает date_time
+        await message.answer(f"✅ Запланировано на {dt.strftime('%d.%m.%Y %H:%M')}.",
+                             reply_markup=await kb.posts_menu_kb(cid))
 
 
 @router.callback_query(F.data.startswith("delpost:"))

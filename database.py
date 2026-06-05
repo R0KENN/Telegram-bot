@@ -7,6 +7,8 @@ from config import DB_PATH, DEFAULTS
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL;")
+        await db.execute("PRAGMA synchronous=NORMAL;")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS chats (
                 chat_id INTEGER PRIMARY KEY,
@@ -53,6 +55,27 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS banned_words (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 chat_id INTEGER, word TEXT
+            )
+        """)
+        # Запрещённые слова
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS banned_words (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER, word TEXT
+            )
+        """)
+        # Темы форума (только созданные ботом)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS topics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER, thread_id INTEGER, name TEXT
+            )
+        """)
+                # Учёт постов, на которые бот уже поставил реакцию
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS reacted_posts (
+                chat_id INTEGER, message_id INTEGER,
+                PRIMARY KEY (chat_id, message_id)
             )
         """)
         await db.commit()
@@ -162,6 +185,18 @@ async def get_member_ids(chat_id):
         async with db.execute("SELECT user_id FROM members WHERE chat_id=?", (chat_id,)) as cur:
             return [r[0] for r in await cur.fetchall()]
 
+
+
+async def remove_members(chat_id, user_ids):
+    """Удаляет из базы участников, которые заблокировали бота / недоступны."""
+    if not user_ids:
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.executemany(
+            "DELETE FROM members WHERE chat_id=? AND user_id=?",
+            [(chat_id, uid) for uid in user_ids]
+        )
+        await db.commit()
 
 # ====== ПОСТЫ ======
 async def add_post(chat_id, text, btn_text, btn_url, publish_at):
@@ -299,7 +334,9 @@ async def delete_banned_word(word_id, chat_id):
         """)
         await db.commit()
 
-# ====== ТЕМЫ (forum topics) ======
+
+
+# ====== ТЕМЫ ФОРУМА ======
 async def add_topic(chat_id, thread_id, name):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -312,6 +349,44 @@ async def add_topic(chat_id, thread_id, name):
 async def get_topics(chat_id):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT id, thread_id, name FROM topics WHERE chat_id=?", (chat_id,)
+            "SELECT id, thread_id, name FROM topics WHERE chat_id=? ORDER BY id",
+            (chat_id,)
         ) as cur:
             return await cur.fetchall()
+
+
+async def delete_topic(topic_db_id, chat_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM topics WHERE id=? AND chat_id=?", (topic_db_id, chat_id)
+        )
+        await db.commit()
+        
+        
+
+# ====== УЧЁТ РЕАКЦИЙ ======
+async def is_reacted(chat_id, message_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT 1 FROM reacted_posts WHERE chat_id=? AND message_id=?",
+            (chat_id, message_id)
+        ) as cur:
+            return await cur.fetchone() is not None
+
+
+async def mark_reacted(chat_id, message_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO reacted_posts (chat_id, message_id) VALUES (?, ?)",
+            (chat_id, message_id)
+        )
+        await db.commit()
+
+
+async def last_reacted_id(chat_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT MAX(message_id) FROM reacted_posts WHERE chat_id=?", (chat_id,)
+        ) as cur:
+            row = await cur.fetchone()
+            return row[0] if row and row[0] else 0

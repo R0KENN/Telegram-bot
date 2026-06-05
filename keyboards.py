@@ -26,10 +26,13 @@ async def chat_menu_kb(chat_id):
         [InlineKeyboardButton(text=toggle, callback_data=f"toggle:{chat_id}")],
     ]
     if ctype == "channel":
+        react_on = await db.get_setting(chat_id, "auto_reaction") == "1"
+        react_label = "🔥 Авто-реакция: ВКЛ" if react_on else "🔥 Авто-реакция: ВЫКЛ"
         rows += [
             [InlineKeyboardButton(text="⚙️ Приветствие (в личку)", callback_data=f"wmenu:{chat_id}")],
             [InlineKeyboardButton(text="📨 Рассылка", callback_data=f"bc:{chat_id}")],
             [InlineKeyboardButton(text="📝 Посты", callback_data=f"posts:{chat_id}")],
+            [InlineKeyboardButton(text=react_label, callback_data=f"treact:{chat_id}")],
         ]
     else:  # группа
         rows += [
