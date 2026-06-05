@@ -3,7 +3,6 @@ import re
 import time
 from datetime import datetime
 from urllib.parse import urlparse
-from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest
 
 from aiogram import Router, F
 from aiogram.types import (
@@ -397,20 +396,6 @@ async def cmd_deltopic(message: Message):
 def _utf16_len(s: str) -> int:
     """Длина строки в UTF-16 code units — так Telegram считает offset/length."""
     return len(s.encode("utf-16-le")) // 2
-
-
-def build_datetime_entity(prefix: str, placeholder: str, unix_ts: int,
-                          fmt: str = "dd.MM.yyyy HH:mm"):
-    """MessageEntity типа date_time: Telegram покажет время в локали пользователя."""
-    from aiogram.types import MessageEntity
-    return MessageEntity(
-        type="date_time",
-        offset=_utf16_len(prefix),
-        length=_utf16_len(placeholder),
-        unix_time=unix_ts,
-        date_time_format=fmt,
-    )
-
 
 
 def extract_domains(text):

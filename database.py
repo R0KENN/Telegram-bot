@@ -57,13 +57,6 @@ async def init_db():
                 chat_id INTEGER, word TEXT
             )
         """)
-        # Запрещённые слова
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS banned_words (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER, word TEXT
-            )
-        """)
         # Темы форума (только созданные ботом)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS topics (
@@ -71,7 +64,7 @@ async def init_db():
                 chat_id INTEGER, thread_id INTEGER, name TEXT
             )
         """)
-                # Учёт постов, на которые бот уже поставил реакцию
+        # Учёт постов, на которые бот уже поставил реакцию
         await db.execute("""
             CREATE TABLE IF NOT EXISTS reacted_posts (
                 chat_id INTEGER, message_id INTEGER,
@@ -326,14 +319,7 @@ async def delete_banned_word(word_id, chat_id):
         await db.execute(
             "DELETE FROM banned_words WHERE id=? AND chat_id=?", (word_id, chat_id)
         )
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS topics (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER, thread_id INTEGER, name TEXT
-            )
-        """)
         await db.commit()
-
 
 
 # ====== ТЕМЫ ФОРУМА ======
