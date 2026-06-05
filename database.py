@@ -390,3 +390,13 @@ async def last_reacted_id(chat_id):
         ) as cur:
             row = await cur.fetchone()
             return row[0] if row and row[0] else 0
+
+
+async def delete_chat(chat_id):
+    """Полностью удаляет чат и все связанные с ним данные."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        for table in ("settings", "members", "posts", "welcome_buttons",
+                      "allowed_domains", "banned_words", "topics", "reacted_posts"):
+            await db.execute(f"DELETE FROM {table} WHERE chat_id=?", (chat_id,))
+        await db.execute("DELETE FROM chats WHERE chat_id=?", (chat_id,))
+        await db.commit()

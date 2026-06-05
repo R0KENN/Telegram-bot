@@ -21,7 +21,7 @@ async def main():
     dp.include_router(router)
 
     await db.init_db()
-    await bot.delete_webhook(drop_pending_updates=True)
+    await bot.delete_webhook(drop_pending_updates=False)
     asyncio.create_task(scheduler(bot))
 
     logger.info("Бот запущен")

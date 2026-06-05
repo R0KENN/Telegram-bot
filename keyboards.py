@@ -33,6 +33,7 @@ async def chat_menu_kb(chat_id):
             [InlineKeyboardButton(text="📨 Рассылка", callback_data=f"bc:{chat_id}")],
             [InlineKeyboardButton(text="📝 Посты", callback_data=f"posts:{chat_id}")],
             [InlineKeyboardButton(text=react_label, callback_data=f"treact:{chat_id}")],
+            [InlineKeyboardButton(text="🔁 Реакции на старые посты", callback_data=f"reactall:{chat_id}")],
         ]
     else:  # группа
         rows += [
@@ -41,6 +42,7 @@ async def chat_menu_kb(chat_id):
         ]
     rows += [
         [InlineKeyboardButton(text="♻️ Сбросить настройки", callback_data=f"reset:{chat_id}")],
+        [InlineKeyboardButton(text="🗑 Удалить из списка", callback_data=f"delchat:{chat_id}")],
         [InlineKeyboardButton(text="⬅️ К списку", callback_data="chats")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)

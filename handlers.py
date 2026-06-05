@@ -23,6 +23,9 @@ from config import ADMIN_ID, TZ, TIMEZONE_OFFSET, BROADCAST_PAUSE
 
 router = Router()
 
+# Каналы, по которым прямо сейчас идёт перебор /reactall (защита от повторного запуска)
+_reactall_running: set[int] = set()
+
 URL_RE = re.compile(r'(https?://[^\s]+|www\.[^\s]+|t\.me/[^\s]+|@\w+)', re.IGNORECASE)
 
 
@@ -93,12 +96,24 @@ async def on_forward(message: Message):
 
 # Регистрация группы при добавлении бота
 @router.my_chat_member()
-async def on_added_to_group(event: ChatMemberUpdated):
+async def on_added_to_chat(event: ChatMemberUpdated):
     chat = event.chat
-    if chat.type not in ("group", "supergroup"):
-        return
     new_status = event.new_chat_member.status
-    if new_status in ("administrator", "member"):
+    if new_status not in ("administrator", "member"):
+        return
+
+    if chat.type == "channel":
+        is_new = await db.register_chat(chat.id, chat.title or str(chat.id), "channel")
+        if is_new:
+            try:
+                await event.bot.send_message(
+                    ADMIN_ID,
+                    f"✅ Бот добавлен в канал «{chat.title}».\n"
+                    f"Открой /menu для настройки."
+                )
+            except Exception:
+                pass
+    elif chat.type in ("group", "supergroup"):
         is_new = await db.register_chat(chat.id, chat.title or str(chat.id), "group")
         if is_new:
             try:
@@ -110,7 +125,6 @@ async def on_added_to_group(event: ChatMemberUpdated):
                 )
             except Exception:
                 pass
-
 
 # ============================================================
 #            АВТО-РЕАКЦИИ НА ПОСТЫ В КАНАЛЕ
@@ -162,24 +176,25 @@ async def _reactall_worker(bot, chat_id, top_message_id, depth, emoji, notify_to
     done = 0          # успешно поставлено реакций
     skipped = 0       # уже были отреагированы
     start = max(1, top_message_id - depth + 1)
-    for mid in range(top_message_id, start - 1, -1):
-        if await db.is_reacted(chat_id, mid):
-            skipped += 1
-            continue
-        ok = await _put_reaction(bot, chat_id, mid, emoji)
-        if ok:
-            done += 1
-        await asyncio.sleep(0.4)  # бережём лимиты Telegram
     try:
-        await bot.send_message(
-            notify_to,
-            f"✅ Готово. Поставлено реакций: {done}, "
-            f"уже были: {skipped}, диапазон: {start}–{top_message_id}."
-        )
-    except Exception:
-        pass
-
-
+        for mid in range(top_message_id, start - 1, -1):
+            if await db.is_reacted(chat_id, mid):
+                skipped += 1
+                continue
+            ok = await _put_reaction(bot, chat_id, mid, emoji)
+            if ok:
+                done += 1
+            await asyncio.sleep(0.4)  # бережём лимиты Telegram
+        try:
+            await bot.send_message(
+                notify_to,
+                f"✅ Готово. Поставлено реакций: {done}, "
+                f"уже были: {skipped}, диапазон: {start}–{top_message_id}."
+            )
+        except Exception:
+            pass
+    finally:
+        _reactall_running.discard(chat_id)  # снимаем флаг в любом случае
 
 @router.message(Command("reactall"), F.chat.type == ChatType.PRIVATE)
 async def cmd_reactall(message: Message):
@@ -210,7 +225,12 @@ async def cmd_reactall(message: Message):
         )
         return
 
+    if chat_id in _reactall_running:
+        await message.answer("⚠️ По этому каналу перебор уже идёт. Дождись отчёта.")
+        return
+
     emoji = await db.get_setting(chat_id, "reaction_emoji") or "🔥"
+    _reactall_running.add(chat_id)  # ставим флаг до запуска задачи
     await message.answer(
         f"⏳ Запускаю перебор {depth} постов вниз от id {top}. "
         f"Это займёт примерно {int(depth * 0.4)} сек. Пришлю отчёт по завершении."
@@ -218,6 +238,34 @@ async def cmd_reactall(message: Message):
     asyncio.create_task(
         _reactall_worker(message.bot, chat_id, top, depth, emoji, message.from_user.id)
     )
+
+@router.callback_query(F.data.startswith("reactall:"))
+async def cb_reactall(c: CallbackQuery):
+    if not is_admin_id(c.from_user.id):
+        await c.answer()
+        return
+    chat_id = int(c.data.split(":")[1])
+    if chat_id in _reactall_running:
+        await c.answer("По этому каналу перебор уже идёт.", show_alert=True)
+        return
+    top = await db.last_reacted_id(chat_id)
+    if not top:
+        await c.answer(
+            "Сначала опубликуй любой новый пост, потом запусти снова.",
+            show_alert=True
+        )
+        return
+    depth = 500
+    emoji = await db.get_setting(chat_id, "reaction_emoji") or "🔥"
+    _reactall_running.add(chat_id)
+    await c.message.answer(
+        f"⏳ Запускаю перебор {depth} постов вниз от id {top}. "
+        f"Это займёт примерно {int(depth * 0.4)} сек. Пришлю отчёт по завершении."
+    )
+    asyncio.create_task(
+        _reactall_worker(c.bot, chat_id, top, depth, emoji, c.from_user.id)
+    )
+    await c.answer("Запущено")
 
 # ============================================================
 #                       ЗАЯВКИ
@@ -535,6 +583,29 @@ async def cb_reset(c: CallbackQuery):
     await c.message.edit_reply_markup(reply_markup=await kb.chat_menu_kb(chat_id))
     await c.answer("Настройки сброшены")
 
+@router.callback_query(F.data.startswith("delchat:"))
+async def cb_delchat(c: CallbackQuery):
+    chat_id = int(c.data.split(":")[1])
+    chat = await db.get_chat(chat_id)
+    title = chat[1] if chat else "чат"
+    kb_confirm = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"delchatok:{chat_id}")],
+        [InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"ch:{chat_id}")],
+    ])
+    await c.message.edit_text(
+        f"🗑 Удалить «{title}» из списка бота?\n\n"
+        f"Бот перестанет управлять этим чатом. Сам чат в Telegram НЕ удаляется.",
+        reply_markup=kb_confirm
+    )
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("delchatok:"))
+async def cb_delchat_ok(c: CallbackQuery):
+    chat_id = int(c.data.split(":")[1])
+    await db.delete_chat(chat_id)
+    await c.message.edit_text("✅ Удалено из списка.", reply_markup=await kb.chats_kb())
+    await c.answer("Удалено")
 
 # ============================================================
 #            ПРИВЕТСТВИЕ В ЛИЧКУ (каналы) + КНОПКИ
