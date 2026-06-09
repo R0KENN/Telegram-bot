@@ -408,3 +408,52 @@ async def clear_reacted(chat_id):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM reacted_posts WHERE chat_id=?", (chat_id,))
         await db.commit()
+
+# ====== ЛОГ-ГРУППА И ТЕМЫ ПО ЧАТАМ ======
+# Глобальная лог-группа (одна на всё). Храним под служебным chat_id=0.
+async def set_global_log_chat(log_chat_id):
+    await set_setting(0, "global_log_chat", str(log_chat_id))
+
+
+async def get_global_log_chat():
+    val = await get_setting(0, "global_log_chat")
+    return int(val) if val and val.lstrip("-").isdigit() else None
+
+
+# Тема конкретного управляемого чата
+async def set_log_thread(chat_id, thread_id):
+    await set_setting(chat_id, "log_thread_id", str(thread_id))
+
+
+async def get_log_thread(chat_id):
+    val = await get_setting(chat_id, "log_thread_id")
+    return int(val) if val and val.lstrip("-").isdigit() else None
+
+# ====== МАРШРУТИЗАЦИЯ ПО ТЕМАМ ======
+# Куда (в какую супергруппу) слать логи для данного управляемого чата
+async def set_log_chat(chat_id, log_chat_id):
+    await set_setting(chat_id, "log_chat_id", str(log_chat_id))
+
+
+async def get_log_chat(chat_id):
+    val = await get_setting(chat_id, "log_chat_id")
+    return int(val) if val else None
+
+
+# Привязка типа события -> thread_id темы
+async def set_topic_route(chat_id, event_key, thread_id):
+    await set_setting(chat_id, f"topic_route:{event_key}", str(thread_id))
+
+
+async def get_topic_route(chat_id, event_key):
+    val = await get_setting(chat_id, f"topic_route:{event_key}")
+    return int(val) if val and val.lstrip("-").isdigit() else None
+
+async def delete_topics_by_thread(log_chat_id, thread_id):
+    """Удаляет запись о теме из таблицы topics по thread_id."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM topics WHERE chat_id=? AND thread_id=?",
+            (log_chat_id, thread_id)
+        )
+        await db.commit()

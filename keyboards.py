@@ -38,6 +38,8 @@ async def chat_menu_kb(chat_id):
             [InlineKeyboardButton(text="👋 Приветствие в группе", callback_data=f"gw:{chat_id}")],
         ]
     rows += [
+        [InlineKeyboardButton(text="🧵 Темы для уведомлений", callback_data=f"routes:{chat_id}")],
+        [InlineKeyboardButton(text="🧵 Тема для логов", callback_data=f"logtopic:{chat_id}")],
         [InlineKeyboardButton(text="♻️ Сбросить настройки", callback_data=f"reset:{chat_id}")],
         [InlineKeyboardButton(text="🗑 Удалить из списка", callback_data=f"delchat:{chat_id}")],
         [InlineKeyboardButton(text="⬅️ К списку", callback_data="chats")],
@@ -137,6 +139,102 @@ def skip_kb(chat_id):
         [InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"posts:{chat_id}")],
     ])
 
+# --- маршрутизация по темам ---
+# Список событий, которые можно раскидать по темам
+TOPIC_EVENTS = [
+    ("join", "📥 Заявки"),
+    ("newmember", "➕ Новые участники"),
+    ("report", "🛡 Модерация/отчёты"),
+]
+
+
+async def topics_route_kb(chat_id):
+    log_chat = await db.get_log_chat(chat_id)
+    rows = []
+    if not log_chat:
+        rows.append([InlineKeyboardButton(
+            text="📌 Сначала выбери лог-группу", callback_data=f"setloggrp:{chat_id}"
+        )])
+    else:
+        for event_key, label in TOPIC_EVENTS:
+            thread_id = await db.get_topic_route(chat_id, event_key)
+            name = "— не задано"
+            if thread_id:
+                for _id, t_id, t_name in await db.get_topics(log_chat):
+                    if t_id == thread_id:
+                        name = t_name
+                        break
+            rows.append([InlineKeyboardButton(
+                text=f"{label}: {name}",
+                callback_data=f"pickroute:{chat_id}:{event_key}"
+            )])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"ch:{chat_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def topic_choice_kb(chat_id, event_key, log_chat):
+    """Список тем лог-группы для выбора под конкретное событие."""
+    rows = []
+    for _id, thread_id, name in await db.get_topics(log_chat):
+        rows.append([InlineKeyboardButton(
+            text=name, callback_data=f"setroute:{chat_id}:{event_key}:{thread_id}"
+        )])
+    if not rows:
+        rows.append([InlineKeyboardButton(
+            text="В лог-группе нет тем (создай /newtopic)", callback_data=f"routes:{chat_id}"
+        )])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"routes:{chat_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+# --- привязка темы лог-группы к чату ---
+async def log_topic_kb(chat_id):
+    log_chat = await db.get_global_log_chat()
+    rows = []
+    if not log_chat:
+        rows.append([InlineKeyboardButton(
+            text="📌 Сначала задать лог-группу", callback_data=f"setlogchat:{chat_id}"
+        )])
+    else:
+        thread_id = await db.get_log_thread(chat_id)
+        cur_name = "— не задано"
+        if thread_id:
+            for _id, t_id, t_name in await db.get_topics(log_chat):
+                if t_id == thread_id:
+                    cur_name = t_name
+                    break
+        rows.append([InlineKeyboardButton(
+            text=f"Текущая тема: {cur_name}", callback_data=f"logtopic:{chat_id}"
+        )])
+        rows.append([InlineKeyboardButton(
+            text="📋 Выбрать тему", callback_data=f"picklogtopic:{chat_id}"
+        )])
+        rows.append([InlineKeyboardButton(
+            text="⚙️ Создать темы для всех чатов", callback_data=f"autotopics:{chat_id}"
+        )])
+        disabled = await db.get_setting(chat_id, "log_disabled") == "1"
+        dtoggle = "🔴 Логи в тему: ВЫКЛ" if disabled else "🟢 Логи в тему: ВКЛ"
+        rows.append([InlineKeyboardButton(
+            text=dtoggle, callback_data=f"logtoggle:{chat_id}"
+        )])
+        rows.append([InlineKeyboardButton(
+            text="🔄 Сменить лог-группу", callback_data=f"setlogchat:{chat_id}"
+        )])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"ch:{chat_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def log_topic_choice_kb(chat_id, log_chat):
+    rows = []
+    for _id, thread_id, name in await db.get_topics(log_chat):
+        rows.append([InlineKeyboardButton(
+            text=name, callback_data=f"setlogtopic:{chat_id}:{thread_id}"
+        )])
+    if not rows:
+        rows.append([InlineKeyboardButton(
+            text="В лог-группе нет тем — создай /newtopic", callback_data=f"logtopic:{chat_id}"
+        )])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"logtopic:{chat_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def back_kb(target):
     return InlineKeyboardMarkup(inline_keyboard=[

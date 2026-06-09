@@ -42,11 +42,118 @@ class Form(StatesGroup):
     gw_ttl = State()
     domain = State()
     word = State()
+    log_chat = State()
 
 
 def is_admin_id(uid):
     return uid == ADMIN_ID
 
+async def send_chat_log(bot, chat_id, text, reply_markup=None):
+    if await db.get_setting(chat_id, "log_disabled") == "1":
+        return  # логи отключены — ничего не шлём
+
+    """
+    Шлёт уведомление по чату chat_id в его тему лог-группы.
+    Если отправка в тему упала (тема удалена и т.п.) — пробует пересоздать
+    тему и повторить. Если и это не вышло — fallback в личку админу.
+    """
+    log_chat = await db.get_global_log_chat()
+    thread_id = await db.get_log_thread(chat_id)
+
+    if log_chat and thread_id:
+        try:
+            await bot.send_message(
+                log_chat, text,
+                message_thread_id=thread_id,
+                reply_markup=reply_markup,
+            )
+            return
+        except Exception:
+            # тема, возможно, удалена — пробуем восстановить
+            chat = await db.get_chat(chat_id)
+            title = chat[1] if chat else str(chat_id)
+            new_thread = await ensure_log_topic(bot, chat_id, title, force=True)
+            if new_thread:
+                try:
+                    await bot.send_message(
+                        log_chat, text,
+                        message_thread_id=new_thread,
+                        reply_markup=reply_markup,
+                    )
+                    return
+                except Exception:
+                    pass  # пересоздание не помогло — уходим в fallback
+
+    # fallback в личку
+    try:
+        await bot.send_message(ADMIN_ID, text, reply_markup=reply_markup)
+    except Exception:
+        pass
+
+async def send_to_topic(bot, chat_id, event_key, text, reply_markup=None):
+    """
+    Отправляет уведомление в тему лог-группы, привязанную к event_key.
+    Если маршрут не настроен — шлёт админу в личку (старое поведение).
+    chat_id — id управляемого канала/группы, к которому относится событие.
+    """
+    log_chat = await db.get_log_chat(chat_id)
+    thread_id = await db.get_topic_route(chat_id, event_key)
+    if log_chat and thread_id:
+        try:
+            await bot.send_message(
+                log_chat, text,
+                message_thread_id=thread_id,
+                reply_markup=reply_markup,
+            )
+            return
+        except Exception:
+            pass  # тема удалена / нет прав — падаем в fallback ниже
+    try:
+        await bot.send_message(ADMIN_ID, text, reply_markup=reply_markup)
+    except Exception:
+        pass
+
+async def ensure_log_topic(bot, chat_id, title, force=False):
+    if await db.get_setting(chat_id, "log_disabled") == "1":
+        return None  # логи для этого чата отключены вручную
+    # уже привязана и не требуем пересоздания — ничего не делаем
+    if not force:
+        existing = await db.get_log_thread(chat_id)
+        if existing:
+            return existing
+
+    log_chat = await db.get_global_log_chat()
+    if not log_chat:
+        return None  # лог-группа ещё не задана — пропускаем
+
+    if chat_id == log_chat:
+        return None  # это сама лог-группа, тему под неё не создаём
+
+    try:
+        if force:
+            old_thread = await db.get_log_thread(chat_id)
+        if old_thread:
+            await db.delete_topics_by_thread(log_chat, old_thread)
+        topic = await bot.create_forum_topic(chat_id=log_chat, name=title[:128])
+    except Exception:
+        return None  # нет прав / режим тем выключен
+
+    thread_id = topic.message_thread_id
+    # регистрируем тему в базе (чтобы была видна в /topics и в выборе)
+    await db.add_topic(log_chat, thread_id, title[:128])
+    # привязываем тему к чату
+    await db.set_log_thread(chat_id, thread_id)
+
+    # приветственное сообщение в новую тему
+    try:
+        await bot.send_message(
+            log_chat,
+            f"🧵 Тема для «{title}» создана. Сюда будет приходить вся информация по этому чату.",
+            message_thread_id=thread_id,
+        )
+    except Exception:
+        pass
+    return thread_id
 
 # ============================================================
 #                  ЛИЧНЫЕ СООБЩЕНИЯ / МЕНЮ
@@ -90,6 +197,8 @@ async def on_forward(message: Message):
         await message.answer("Это не канал. Для групп просто добавь бота в группу.")
         return
     is_new = await db.register_chat(chat.id, chat.title or str(chat.id), "channel")
+    if is_new:
+        await ensure_log_topic(message.bot, chat.id, chat.title or str(chat.id))
     note = "\n\n⚠️ Автоприём выключен по умолчанию — включи его в меню." if is_new else ""
     await message.answer(f"✅ Канал «{chat.title}» добавлен. Открой /menu.{note}")
 
@@ -105,6 +214,8 @@ async def on_added_to_chat(event: ChatMemberUpdated):
     if chat.type == "channel":
         is_new = await db.register_chat(chat.id, chat.title or str(chat.id), "channel")
         if is_new:
+            await ensure_log_topic(event.bot, chat.id, chat.title or str(chat.id))
+        if is_new:
             try:
                 await event.bot.send_message(
                     ADMIN_ID,
@@ -116,6 +227,7 @@ async def on_added_to_chat(event: ChatMemberUpdated):
     elif chat.type in ("group", "supergroup"):
         is_new = await db.register_chat(chat.id, chat.title or str(chat.id), "group")
         if is_new:
+            await ensure_log_topic(event.bot, chat.id, chat.title or str(chat.id))
             try:
                 await event.bot.send_message(
                     ADMIN_ID,
@@ -378,14 +490,11 @@ async def on_join_request(request: ChatJoinRequest):
 async def notify_admin(bot, request: ChatJoinRequest, approved: bool):
     user = request.from_user
     status = "✅ одобрена" if approved else "⏳ ожидает (автоприём выкл.)"
-    try:
-        await bot.send_message(
-            ADMIN_ID,
-            f"📥 Заявка в «{request.chat.title}» ({status})\n"
-            f"{user.full_name} | @{user.username or '—'} | <code>{user.id}</code>"
-        )
-    except Exception:
-        pass
+    text = (
+        f"📥 Заявка в «{request.chat.title}» ({status})\n"
+        f"{user.full_name} | @{user.username or '—'} | <code>{user.id}</code>"
+    )
+    await send_chat_log(bot, request.chat.id, text)
 
 
 async def send_delayed_welcome(bot, chat_id, user_id):
@@ -531,6 +640,11 @@ async def on_new_member(message: Message):
         if member.is_bot:
             continue
         await db.save_member(chat_id, member.id, member.full_name, member.username or "")
+        await send_chat_log(
+            message.bot, chat_id,
+            f"➕ Новый участник: {member.full_name} | "
+            f"@{member.username or '—'} | <code>{member.id}</code>"
+        )
         text = text_tmpl.replace("{name}", member.full_name)
         try:
             sent = await message.answer(text)
@@ -567,6 +681,11 @@ async def moderate(message: Message):
         if any(w in low for w in banned):
             try:
                 await message.delete()
+                await send_chat_log(
+                message.bot, chat_id,
+                f"🛡 Удалено сообщение от {message.from_user.full_name} "
+                f"(@{message.from_user.username or '—'})"
+            )
             except Exception:
                 pass
             return
@@ -582,6 +701,11 @@ async def moderate(message: Message):
             if not all(is_allowed(h) for h in found):
                 try:
                     await message.delete()
+                    await send_chat_log(
+                message.bot, chat_id,
+                f"🛡 Удалено сообщение от {message.from_user.full_name} "
+                f"(@{message.from_user.username or '—'})"
+            )
                 except Exception:
                     pass
                 return
@@ -646,9 +770,212 @@ async def cb_toggle(c: CallbackQuery):
 @router.callback_query(F.data.startswith("reset:"))
 async def cb_reset(c: CallbackQuery):
     chat_id = int(c.data.split(":")[1])
+    chat = await db.get_chat(chat_id)
+    title = chat[1] if chat else "чат"
+    kb_confirm = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"resetok:{chat_id}")],
+        [InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"ch:{chat_id}")],
+    ])
+    await c.message.edit_text(
+        f"♻️ Сбросить все настройки чата «{title}»?\n\n"
+        f"Будут сброшены: автоприём, приветствия, модерация, реакции, "
+        f"привязка темы и т.д. Действие необратимо.",
+        reply_markup=kb_confirm
+    )
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("resetok:"))
+async def cb_reset_ok(c: CallbackQuery):
+    chat_id = int(c.data.split(":")[1])
     await db.reset_settings(chat_id)
-    await c.message.edit_reply_markup(reply_markup=await kb.chat_menu_kb(chat_id))
+    chat = await db.get_chat(chat_id)
+    title = chat[1] if chat else "чат"
+    icon = "📢" if chat and chat[2] == "channel" else "👥"
+    await c.message.edit_text(
+        f"✅ Настройки сброшены.\n\n{icon} <b>{title}</b>\nЧто настроим?",
+        reply_markup=await kb.chat_menu_kb(chat_id)
+    )
     await c.answer("Настройки сброшены")
+
+# ============================================================
+#            ТЕМА ЛОГ-ГРУППЫ ДЛЯ КАЖДОГО ЧАТА
+# ============================================================
+@router.callback_query(F.data.startswith("logtopic:"))
+async def cb_logtopic(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    chat_id = int(c.data.split(":")[1])
+    await c.message.edit_text(
+        "🧵 <b>Тема для логов этого чата</b>\n\n"
+        "Вся информация по этому каналу/группе будет уходить в выбранную тему "
+        "лог-группы. Темы создаются командой /newtopic прямо в лог-группе.",
+        reply_markup=await kb.log_topic_kb(chat_id)
+    )
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("setlogchat:"))
+async def cb_setlogchat(c: CallbackQuery, state: FSMContext):
+    chat_id = int(c.data.split(":")[1])
+    await state.update_data(route_chat_id=chat_id)
+    await state.set_state(Form.log_chat)
+    await c.message.edit_text(
+        "Пришли ID супергруппы-лога (с включёнными темами).\n"
+        "Это id вида <code>-100...</code>\n\n"
+        "Бот должен быть в ней админом с правом «Управление темами».\n"
+        "Эта группа общая для всех твоих чатов — задаётся один раз.",
+        reply_markup=kb.back_kb(f"logtopic:{chat_id}")
+    )
+    await c.answer()
+
+
+@router.message(Form.log_chat)
+async def in_log_chat(message: Message, state: FSMContext):
+    if not is_admin_id(message.from_user.id):
+        return
+    val = message.text.strip()
+    if not val.lstrip("-").isdigit():
+        await message.answer("Нужен числовой ID группы (например -1001234567890).")
+        return
+    data = await state.get_data()
+    cid = data["route_chat_id"]
+    await db.set_global_log_chat(int(val))
+    await state.clear()
+    await message.answer(
+        "✅ Лог-группа сохранена (общая для всех чатов).",
+        reply_markup=await kb.log_topic_kb(cid)
+    )
+
+
+@router.callback_query(F.data.startswith("picklogtopic:"))
+async def cb_picklogtopic(c: CallbackQuery):
+    chat_id = int(c.data.split(":")[1])
+    log_chat = await db.get_global_log_chat()
+    if not log_chat:
+        await c.answer("Сначала задай лог-группу.", show_alert=True)
+        return
+    await c.message.edit_text(
+        "Выбери тему для этого чата:",
+        reply_markup=await kb.log_topic_choice_kb(chat_id, log_chat)
+    )
+    await c.answer()
+
+@router.callback_query(F.data.startswith("setlogtopic:"))
+async def cb_setlogtopic(c: CallbackQuery):
+    _, chat_id, thread_id = c.data.split(":")
+    await db.set_log_thread(int(chat_id), int(thread_id))
+    await c.message.edit_text(
+        "🧵 <b>Тема для логов этого чата</b>",
+        reply_markup=await kb.log_topic_kb(int(chat_id))
+    )
+    await c.answer("Тема привязана")
+
+@router.callback_query(F.data.startswith("autotopics:"))
+async def cb_autotopics(c: CallbackQuery):
+    if not is_admin_id(c.from_user.id):
+        await c.answer()
+        return
+    back_chat_id = int(c.data.split(":")[1])
+    log_chat = await db.get_global_log_chat()
+    if not log_chat:
+        await c.answer("Сначала задай лог-группу.", show_alert=True)
+        return
+    created = 0
+    for cid, title, ctype in await db.get_chats():
+        if cid == log_chat:
+            continue
+        if await db.get_log_thread(cid):
+            continue  # уже есть тема
+        thread_id = await ensure_log_topic(c.bot, cid, title)
+        if thread_id:
+            created += 1
+        await asyncio.sleep(0.5)  # бережём лимиты Telegram
+    await c.message.edit_text(
+        f"✅ Готово. Создано новых тем: {created}.",
+        reply_markup=await kb.log_topic_kb(back_chat_id)
+    )
+    await c.answer("Готово")
+
+@router.callback_query(F.data.startswith("logtoggle:"))
+async def cb_logtoggle(c: CallbackQuery):
+    chat_id = int(c.data.split(":")[1])
+    cur = await db.get_setting(chat_id, "log_disabled")
+    await db.set_setting(chat_id, "log_disabled", "0" if cur == "1" else "1")
+    await c.message.edit_reply_markup(reply_markup=await kb.log_topic_kb(chat_id))
+    await c.answer("Логи " + ("выключены" if cur != "1" else "включены"))
+
+# ============================================================
+#            МАРШРУТИЗАЦИЯ УВЕДОМЛЕНИЙ ПО ТЕМАМ
+# ============================================================
+@router.callback_query(F.data.startswith("routes:"))
+async def cb_routes(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    chat_id = int(c.data.split(":")[1])
+    await c.message.edit_text(
+        "🧵 <b>Темы для уведомлений</b>\n\n"
+        "Выбери, в какую тему лог-группы слать каждый тип событий.\n"
+        "Темы создаются командой /newtopic прямо в лог-группе.",
+        reply_markup=await kb.topics_route_kb(chat_id)
+    )
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("setloggrp:"))
+async def cb_setloggrp(c: CallbackQuery, state: FSMContext):
+    chat_id = int(c.data.split(":")[1])
+    await state.update_data(route_chat_id=chat_id)
+    await state.set_state(Form.log_chat)
+    await c.message.edit_text(
+        "Пришли ID супергруппы-лога (с темами), куда слать уведомления.\n"
+        "ID можно увидеть в /menu в списке чатов или это id вида -100...\n\n"
+        "Бот должен быть в этой группе админом с правом «Управление темами».",
+        reply_markup=kb.back_kb(f"routes:{chat_id}")
+    )
+    await c.answer()
+
+
+@router.message(Form.log_chat)
+async def in_log_chat(message: Message, state: FSMContext):
+    if not is_admin_id(message.from_user.id):
+        return
+    val = message.text.strip()
+    if not val.lstrip("-").isdigit():
+        await message.answer("Нужен числовой ID группы (например -1001234567890).")
+        return
+    data = await state.get_data()
+    cid = data["route_chat_id"]
+    await db.set_log_chat(cid, int(val))
+    await state.clear()
+    await message.answer(
+        "✅ Лог-группа сохранена.",
+        reply_markup=await kb.topics_route_kb(cid)
+    )
+
+
+@router.callback_query(F.data.startswith("pickroute:"))
+async def cb_pickroute(c: CallbackQuery):
+    _, chat_id, event_key = c.data.split(":")
+    chat_id = int(chat_id)
+    log_chat = await db.get_log_chat(chat_id)
+    if not log_chat:
+        await c.answer("Сначала выбери лог-группу.", show_alert=True)
+        return
+    await c.message.edit_text(
+        "Выбери тему для этого типа уведомлений:",
+        reply_markup=await kb.topic_choice_kb(chat_id, event_key, log_chat)
+    )
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("setroute:"))
+async def cb_setroute(c: CallbackQuery):
+    _, chat_id, event_key, thread_id = c.data.split(":")
+    await db.set_topic_route(int(chat_id), event_key, int(thread_id))
+    await c.message.edit_text(
+        "🧵 <b>Темы для уведомлений</b>",
+        reply_markup=await kb.topics_route_kb(int(chat_id))
+    )
+    await c.answer("Тема привязана")
 
 @router.callback_query(F.data.startswith("delchat:"))
 async def cb_delchat(c: CallbackQuery):
@@ -656,7 +983,7 @@ async def cb_delchat(c: CallbackQuery):
     chat = await db.get_chat(chat_id)
     title = chat[1] if chat else "чат"
     kb_confirm = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"delchatok:{chat_id}")],
+        [InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"delchatok:{chat_id}")],
         [InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"ch:{chat_id}")],
     ])
     await c.message.edit_text(
