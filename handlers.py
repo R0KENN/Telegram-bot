@@ -49,8 +49,6 @@ def is_admin_id(uid):
     return uid == ADMIN_ID
 
 async def send_chat_log(bot, chat_id, text, reply_markup=None):
-    if await db.get_setting(chat_id, "log_disabled") == "1":
-        return  # логи отключены — ничего не шлём
 
     """
     Шлёт уведомление по чату chat_id в его тему лог-группы.
@@ -60,6 +58,8 @@ async def send_chat_log(bot, chat_id, text, reply_markup=None):
     log_chat = await db.get_global_log_chat()
     thread_id = await db.get_log_thread(chat_id)
 
+    if await db.get_setting(chat_id, "log_disabled") == "1":
+        return  # логи отключены — ничего не шлём
     if log_chat and thread_id:
         try:
             await bot.send_message(
@@ -129,11 +129,12 @@ async def ensure_log_topic(bot, chat_id, title, force=False):
     if chat_id == log_chat:
         return None  # это сама лог-группа, тему под неё не создаём
 
-    try:
-        if force:
-            old_thread = await db.get_log_thread(chat_id)
+    if force:
+        old_thread = await db.get_log_thread(chat_id)
         if old_thread:
             await db.delete_topics_by_thread(log_chat, old_thread)
+
+    try:
         topic = await bot.create_forum_topic(chat_id=log_chat, name=title[:128])
     except Exception:
         return None  # нет прав / режим тем выключен
@@ -666,6 +667,14 @@ async def delete_later(bot, chat_id, message_id, delay):
 @router.message(F.chat.type.in_({"group", "supergroup"}))
 async def moderate(message: Message):
     chat_id = message.chat.id
+
+    # Пост привязанного канала, автоматически пересланный в обсуждение — не трогаем
+    if message.is_automatic_forward:
+        return
+    # Сообщение от имени канала/чата (sender_chat), а не от пользователя — не трогаем
+    if message.sender_chat:
+        return
+
     if not message.from_user:
         return
     # Админов не трогаем
@@ -682,10 +691,10 @@ async def moderate(message: Message):
             try:
                 await message.delete()
                 await send_chat_log(
-                message.bot, chat_id,
-                f"🛡 Удалено сообщение от {message.from_user.full_name} "
-                f"(@{message.from_user.username or '—'})"
-            )
+                    message.bot, chat_id,
+                    f"🛡 Удалено сообщение от {message.from_user.full_name} "
+                    f"(@{message.from_user.username or '—'})"
+                )
             except Exception:
                 pass
             return
@@ -903,6 +912,48 @@ async def cb_logtoggle(c: CallbackQuery):
     await db.set_setting(chat_id, "log_disabled", "0" if cur == "1" else "1")
     await c.message.edit_reply_markup(reply_markup=await kb.log_topic_kb(chat_id))
     await c.answer("Логи " + ("выключены" if cur != "1" else "включены"))
+
+@router.callback_query(F.data.startswith("deltopicchat:"))
+async def cb_deltopicchat(c: CallbackQuery):
+    chat_id = int(c.data.split(":")[1])
+    kb_confirm = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"deltopicchatok:{chat_id}")],
+        [InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"logtopic:{chat_id}")],
+    ])
+    await c.message.edit_text(
+        "🗑 Удалить тему этого чата в лог-группе?\n\n"
+        "Тема будет удалена в Telegram, а логи по этому чату отключены, "
+        "чтобы тема не создалась заново.",
+        reply_markup=kb_confirm
+    )
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("deltopicchatok:"))
+async def cb_deltopicchat_ok(c: CallbackQuery):
+    chat_id = int(c.data.split(":")[1])
+    log_chat = await db.get_global_log_chat()
+    thread_id = await db.get_log_thread(chat_id)
+
+    # отключаем логи, чтобы тема не пересоздалась самовосстановлением
+    await db.set_setting(chat_id, "log_disabled", "1")
+
+    if log_chat and thread_id:
+        try:
+            await c.bot.delete_forum_topic(chat_id=log_chat, message_thread_id=thread_id)
+        except Exception:
+            pass
+        await db.delete_topics_by_thread(log_chat, thread_id)
+
+    # убираем привязку темы у чата
+    await db.set_setting(chat_id, "log_thread_id", "")
+
+    await c.message.edit_text(
+        "✅ Тема удалена, логи по этому чату отключены.\n"
+        "Чтобы снова получать логи — включи их и привяжи/создай тему.",
+        reply_markup=await kb.log_topic_kb(chat_id)
+    )
+    await c.answer("Удалено")
 
 # ============================================================
 #            МАРШРУТИЗАЦИЯ УВЕДОМЛЕНИЙ ПО ТЕМАМ

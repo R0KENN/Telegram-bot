@@ -38,7 +38,6 @@ async def chat_menu_kb(chat_id):
             [InlineKeyboardButton(text="👋 Приветствие в группе", callback_data=f"gw:{chat_id}")],
         ]
     rows += [
-        [InlineKeyboardButton(text="🧵 Темы для уведомлений", callback_data=f"routes:{chat_id}")],
         [InlineKeyboardButton(text="🧵 Тема для логов", callback_data=f"logtopic:{chat_id}")],
         [InlineKeyboardButton(text="♻️ Сбросить настройки", callback_data=f"reset:{chat_id}")],
         [InlineKeyboardButton(text="🗑 Удалить из списка", callback_data=f"delchat:{chat_id}")],
@@ -216,6 +215,10 @@ async def log_topic_kb(chat_id):
         rows.append([InlineKeyboardButton(
             text=dtoggle, callback_data=f"logtoggle:{chat_id}"
         )])
+        if thread_id:
+            rows.append([InlineKeyboardButton(
+                text="🗑 Удалить тему этого чата", callback_data=f"deltopicchat:{chat_id}"
+            )])
         rows.append([InlineKeyboardButton(
             text="🔄 Сменить лог-группу", callback_data=f"setlogchat:{chat_id}"
         )])
