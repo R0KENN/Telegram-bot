@@ -633,6 +633,11 @@ def build_datetime_entity(prefix: str, placeholder: str, unix_ts: int,
 @router.message(F.new_chat_members)
 async def on_new_member(message: Message):
     chat_id = message.chat.id
+    if await db.get_setting(chat_id, "clean_service") == "1":
+        try:
+            await message.delete()
+        except Exception:
+            pass
     if await db.get_setting(chat_id, "group_welcome_enabled") != "1":
         return
     text_tmpl = await db.get_setting(chat_id, "group_welcome_text")
@@ -662,6 +667,38 @@ async def delete_later(bot, chat_id, message_id, delay):
     except Exception:
         pass
 
+# Очистка системных/сервисных сообщений в группах
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.content_type.in_({
+        "new_chat_members",
+        "left_chat_member",
+        "new_chat_title",
+        "new_chat_photo",
+        "delete_chat_photo",
+        "pinned_message",
+        "group_chat_created",
+        "supergroup_chat_created",
+        "channel_chat_created",
+        "message_auto_delete_timer_changed",
+        "video_chat_scheduled",
+        "video_chat_started",
+        "video_chat_ended",
+        "video_chat_participants_invited",
+        "forum_topic_created",
+        "forum_topic_edited",
+        "forum_topic_closed",
+        "forum_topic_reopened",
+    }),
+)
+async def clean_service_messages(message: Message):
+    chat_id = message.chat.id
+    if await db.get_setting(chat_id, "clean_service") != "1":
+        return
+    try:
+        await message.delete()
+    except Exception:
+        pass  # нет прав / сообщение уже удалено
 
 # Модерация сообщений в группах
 @router.message(F.chat.type.in_({"group", "supergroup"}))
@@ -1214,6 +1251,14 @@ async def cb_twf(c: CallbackQuery):
     await db.set_setting(chat_id, "word_filter", "0" if cur == "1" else "1")
     await c.message.edit_reply_markup(reply_markup=await kb.mod_menu_kb(chat_id))
     await c.answer()
+
+@router.callback_query(F.data.startswith("tcs:"))
+async def cb_tcs(c: CallbackQuery):
+    chat_id = int(c.data.split(":")[1])
+    cur = await db.get_setting(chat_id, "clean_service")
+    await db.set_setting(chat_id, "clean_service", "0" if cur == "1" else "1")
+    await c.message.edit_reply_markup(reply_markup=await kb.mod_menu_kb(chat_id))
+    await c.answer("Чистка системных " + ("включена" if cur != "1" else "выключена"))
 
 @router.callback_query(F.data.startswith("reactions:"))
 async def cb_reactions(c: CallbackQuery):

@@ -79,11 +79,14 @@ async def mod_menu_kb(chat_id):
     word_filter = await db.get_setting(chat_id, "word_filter") == "1"
     t1 = "🟢 Удалять ссылки: ВКЛ" if del_links else "🔴 Удалять ссылки: ВЫКЛ"
     t2 = "🟢 Фильтр слов: ВКЛ" if word_filter else "🔴 Фильтр слов: ВЫКЛ"
+    clean_srv = await db.get_setting(chat_id, "clean_service") == "1"
+    t3 = "🟢 Чистка системных: ВКЛ" if clean_srv else "🔴 Чистка системных: ВЫКЛ"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=t1, callback_data=f"tdl:{chat_id}")],
         [InlineKeyboardButton(text="🌐 Разрешённые домены", callback_data=f"domains:{chat_id}")],
         [InlineKeyboardButton(text=t2, callback_data=f"twf:{chat_id}")],
         [InlineKeyboardButton(text="🚫 Запрещённые слова", callback_data=f"words:{chat_id}")],
+        [InlineKeyboardButton(text=t3, callback_data=f"tcs:{chat_id}")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"ch:{chat_id}")],
     ])
 
