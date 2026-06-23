@@ -36,8 +36,11 @@ async def chat_menu_kb(chat_id):
         rows += [
             [InlineKeyboardButton(text="🛡 Модерация", callback_data=f"mod:{chat_id}")],
             [InlineKeyboardButton(text="👋 Приветствие в группе", callback_data=f"gw:{chat_id}")],
+            [InlineKeyboardButton(text="🤖 Капча для новичков", callback_data=f"captcha:{chat_id}")],
         ]
     rows += [
+        [InlineKeyboardButton(text="📈 График прироста", callback_data=f"chart:{chat_id}"),
+         InlineKeyboardButton(text="📄 Экспорт CSV", callback_data=f"export:{chat_id}")],
         [InlineKeyboardButton(text="🧵 Тема для логов", callback_data=f"logtopic:{chat_id}")],
         [InlineKeyboardButton(text="♻️ Сбросить настройки", callback_data=f"reset:{chat_id}")],
         [InlineKeyboardButton(text="🗑 Удалить из списка", callback_data=f"delchat:{chat_id}")],
@@ -87,6 +90,8 @@ async def mod_menu_kb(chat_id):
         [InlineKeyboardButton(text=t2, callback_data=f"twf:{chat_id}")],
         [InlineKeyboardButton(text="🚫 Запрещённые слова", callback_data=f"words:{chat_id}")],
         [InlineKeyboardButton(text=t3, callback_data=f"tcs:{chat_id}")],
+        [InlineKeyboardButton(text="⚠️ Предупреждения", callback_data=f"warns_menu:{chat_id}")],
+        [InlineKeyboardButton(text="🌊 Антифлуд", callback_data=f"flood_menu:{chat_id}")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"ch:{chat_id}")],
     ])
 
@@ -140,53 +145,6 @@ def skip_kb(chat_id):
         [InlineKeyboardButton(text="⏭ Без кнопки", callback_data=f"nobtn:{chat_id}")],
         [InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"posts:{chat_id}")],
     ])
-
-# --- маршрутизация по темам ---
-# Список событий, которые можно раскидать по темам
-TOPIC_EVENTS = [
-    ("join", "📥 Заявки"),
-    ("newmember", "➕ Новые участники"),
-    ("report", "🛡 Модерация/отчёты"),
-]
-
-
-async def topics_route_kb(chat_id):
-    log_chat = await db.get_log_chat(chat_id)
-    rows = []
-    if not log_chat:
-        rows.append([InlineKeyboardButton(
-            text="📌 Сначала выбери лог-группу", callback_data=f"setloggrp:{chat_id}"
-        )])
-    else:
-        for event_key, label in TOPIC_EVENTS:
-            thread_id = await db.get_topic_route(chat_id, event_key)
-            name = "— не задано"
-            if thread_id:
-                for _id, t_id, t_name in await db.get_topics(log_chat):
-                    if t_id == thread_id:
-                        name = t_name
-                        break
-            rows.append([InlineKeyboardButton(
-                text=f"{label}: {name}",
-                callback_data=f"pickroute:{chat_id}:{event_key}"
-            )])
-    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"ch:{chat_id}")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-async def topic_choice_kb(chat_id, event_key, log_chat):
-    """Список тем лог-группы для выбора под конкретное событие."""
-    rows = []
-    for _id, thread_id, name in await db.get_topics(log_chat):
-        rows.append([InlineKeyboardButton(
-            text=name, callback_data=f"setroute:{chat_id}:{event_key}:{thread_id}"
-        )])
-    if not rows:
-        rows.append([InlineKeyboardButton(
-            text="В лог-группе нет тем (создай /newtopic)", callback_data=f"routes:{chat_id}"
-        )])
-    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"routes:{chat_id}")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 # --- привязка темы лог-группы к чату ---
 async def log_topic_kb(chat_id):
@@ -306,4 +264,48 @@ async def reactions_menu_kb(chat_id):
         [InlineKeyboardButton(text="🔁 Реакции на старые посты", callback_data=f"reactall:{chat_id}")],
         [InlineKeyboardButton(text="🧹 Снять все реакции бота", callback_data=f"clearall:{chat_id}")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"ch:{chat_id}")],
+    ])
+
+# --- капча для новичков ---
+async def captcha_menu_kb(chat_id):
+    enabled = await db.get_setting(chat_id, "captcha_enabled") == "1"
+    toggle = "🟢 Капча: ВКЛ" if enabled else "🔴 Капча: ВЫКЛ"
+    timeout = await db.get_setting(chat_id, "captcha_timeout")
+    action = await db.get_setting(chat_id, "captcha_action")
+    action_label = "кик" if action == "kick" else "без права писать"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=toggle, callback_data=f"captoggle:{chat_id}")],
+        [InlineKeyboardButton(text=f"⏱ Время: {timeout} сек", callback_data=f"captime:{chat_id}")],
+        [InlineKeyboardButton(text=f"⚙️ Не прошёл → {action_label}", callback_data=f"capaction:{chat_id}")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"ch:{chat_id}")],
+    ])
+
+# --- настройка предупреждений ---
+async def warns_menu_kb(chat_id):
+    mute_limit = await db.get_setting(chat_id, "warn_mute_limit")
+    ban_limit = await db.get_setting(chat_id, "warn_ban_limit")
+    mute_minutes = await db.get_setting(chat_id, "warn_mute_minutes")
+    on_mod = await db.get_setting(chat_id, "warn_on_moderation") == "1"
+    mod_toggle = "🟢 Варн при авто-модерации: ВКЛ" if on_mod else "🔴 Варн при авто-модерации: ВЫКЛ"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🔇 Мут после: {mute_limit} варн.", callback_data=f"wsetmute:{chat_id}")],
+        [InlineKeyboardButton(text=f"🚫 Бан после: {ban_limit} варн.", callback_data=f"wsetban:{chat_id}")],
+        [InlineKeyboardButton(text=f"⏱ Длительность мута: {mute_minutes} мин", callback_data=f"wsetminutes:{chat_id}")],
+        [InlineKeyboardButton(text=mod_toggle, callback_data=f"wtogglemod:{chat_id}")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"mod:{chat_id}")],
+    ])
+
+# --- антифлуд ---
+async def flood_menu_kb(chat_id):
+    enabled = await db.get_setting(chat_id, "antiflood_enabled") == "1"
+    toggle = "🟢 Антифлуд: ВКЛ" if enabled else "🔴 Антифлуд: ВЫКЛ"
+    count = await db.get_setting(chat_id, "antiflood_count")
+    window = await db.get_setting(chat_id, "antiflood_window")
+    minutes = await db.get_setting(chat_id, "antiflood_mute_minutes")
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=toggle, callback_data=f"floodtoggle:{chat_id}")],
+        [InlineKeyboardButton(text=f"📊 Лимит: {count} сообщ.", callback_data=f"floodcount:{chat_id}")],
+        [InlineKeyboardButton(text=f"⏱ Окно: {window} сек", callback_data=f"floodwindow:{chat_id}")],
+        [InlineKeyboardButton(text=f"🔇 Мут: {minutes} мин", callback_data=f"floodminutes:{chat_id}")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"mod:{chat_id}")],
     ])

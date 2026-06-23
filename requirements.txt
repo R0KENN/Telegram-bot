@@ -1,3 +1,5 @@
 aiogram
 aiosqlite
 python-dotenv
+aiogram-sqlite-storage
+matplotlib

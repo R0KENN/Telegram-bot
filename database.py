@@ -71,7 +71,22 @@ async def init_db():
                 PRIMARY KEY (chat_id, message_id)
             )
         """)
-        await db.commit()
+                # Предупреждения пользователей
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS warns (
+                chat_id INTEGER, user_id INTEGER, count INTEGER DEFAULT 0,
+                PRIMARY KEY (chat_id, user_id)
+            )
+        """)
+    # --- миграция: медиа в постах ---
+    async with db.execute("PRAGMA table_info(posts)") as cur:
+        cols = [row[1] for row in await cur.fetchall()]
+    if "media_type" not in cols:
+        await db.execute("ALTER TABLE posts ADD COLUMN media_type TEXT")
+    if "media_id" not in cols:
+        await db.execute("ALTER TABLE posts ADD COLUMN media_id TEXT")
+    await db.commit()
+
 
 
 # ====== ЧАТЫ ======
@@ -192,12 +207,13 @@ async def remove_members(chat_id, user_ids):
         await db.commit()
 
 # ====== ПОСТЫ ======
-async def add_post(chat_id, text, btn_text, btn_url, publish_at):
+async def add_post(chat_id, text, btn_text, btn_url, publish_at,
+                   media_type=None, media_id=None):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO posts (chat_id, text, btn_text, btn_url, publish_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (chat_id, text, btn_text, btn_url, publish_at)
+            "INSERT INTO posts (chat_id, text, btn_text, btn_url, publish_at, status, media_type, media_id) "
+            "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
+            (chat_id, text, btn_text, btn_url, publish_at, media_type, media_id),
         )
         await db.commit()
 
@@ -215,8 +231,8 @@ async def get_due_posts():
     now = int(time.time())
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT id, chat_id, text, btn_text, btn_url FROM posts "
-            "WHERE status='pending' AND publish_at<=?", (now,)
+            "SELECT id, chat_id, text, btn_text, btn_url, media_type, media_id, repeat_mode "
+            "FROM posts WHERE status='pending' AND publish_at<=?", (now,)
         ) as cur:
             return await cur.fetchall()
 
@@ -233,6 +249,36 @@ async def cancel_post(post_id, chat_id):
             "UPDATE posts SET status='cancelled' WHERE id=? AND chat_id=?",
             (post_id, chat_id)
         )
+        await db.commit()
+
+async def reschedule_post(post_id, new_publish_at):
+    """Переносит время публикации поста (для повторяющихся)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE posts SET publish_at=?, status='pending' WHERE id=?",
+            (new_publish_at, post_id)
+        )
+        await db.commit()
+
+
+async def get_post(post_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id, chat_id, text, btn_text, btn_url, publish_at, "
+            "media_type, media_id, repeat_mode FROM posts WHERE id=?", (post_id,)
+        ) as cur:
+            return await cur.fetchone()
+
+
+async def update_post_text(post_id, text):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE posts SET text=? WHERE id=?", (text, post_id))
+        await db.commit()
+
+
+async def update_post_time(post_id, publish_at):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE posts SET publish_at=? WHERE id=?", (publish_at, post_id))
         await db.commit()
 
 
@@ -382,7 +428,8 @@ async def delete_chat(chat_id):
     """Полностью удаляет чат и все связанные с ним данные."""
     async with aiosqlite.connect(DB_PATH) as db:
         for table in ("settings", "members", "posts", "welcome_buttons",
-                      "allowed_domains", "banned_words", "topics", "reacted_posts"):
+                      "allowed_domains", "banned_words", "topics", "reacted_posts",
+                      "warns"):
             await db.execute(f"DELETE FROM {table} WHERE chat_id=?", (chat_id,))
         await db.execute("DELETE FROM chats WHERE chat_id=?", (chat_id,))
         await db.commit()
@@ -429,26 +476,6 @@ async def get_log_thread(chat_id):
     val = await get_setting(chat_id, "log_thread_id")
     return int(val) if val and val.lstrip("-").isdigit() else None
 
-# ====== МАРШРУТИЗАЦИЯ ПО ТЕМАМ ======
-# Куда (в какую супергруппу) слать логи для данного управляемого чата
-async def set_log_chat(chat_id, log_chat_id):
-    await set_setting(chat_id, "log_chat_id", str(log_chat_id))
-
-
-async def get_log_chat(chat_id):
-    val = await get_setting(chat_id, "log_chat_id")
-    return int(val) if val else None
-
-
-# Привязка типа события -> thread_id темы
-async def set_topic_route(chat_id, event_key, thread_id):
-    await set_setting(chat_id, f"topic_route:{event_key}", str(thread_id))
-
-
-async def get_topic_route(chat_id, event_key):
-    val = await get_setting(chat_id, f"topic_route:{event_key}")
-    return int(val) if val and val.lstrip("-").isdigit() else None
-
 async def delete_topics_by_thread(log_chat_id, thread_id):
     """Удаляет запись о теме из таблицы topics по thread_id."""
     async with aiosqlite.connect(DB_PATH) as db:
@@ -457,3 +484,74 @@ async def delete_topics_by_thread(log_chat_id, thread_id):
             (log_chat_id, thread_id)
         )
         await db.commit()
+
+# ====== ПРЕДУПРЕЖДЕНИЯ ======
+async def add_warn(chat_id, user_id):
+    """Добавляет предупреждение и возвращает новое количество."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO warns (chat_id, user_id, count) VALUES (?, ?, 1) "
+            "ON CONFLICT(chat_id, user_id) DO UPDATE SET count = count + 1",
+            (chat_id, user_id)
+        )
+        await db.commit()
+        async with db.execute(
+            "SELECT count FROM warns WHERE chat_id=? AND user_id=?", (chat_id, user_id)
+        ) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else 0
+
+
+async def get_warns(chat_id, user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT count FROM warns WHERE chat_id=? AND user_id=?", (chat_id, user_id)
+        ) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else 0
+
+
+async def remove_warn(chat_id, user_id):
+    """Снимает одно предупреждение (не уходит ниже нуля). Возвращает новое количество."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE warns SET count = MAX(count - 1, 0) WHERE chat_id=? AND user_id=?",
+            (chat_id, user_id)
+        )
+        await db.commit()
+        async with db.execute(
+            "SELECT count FROM warns WHERE chat_id=? AND user_id=?", (chat_id, user_id)
+        ) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else 0
+
+
+async def reset_warns(chat_id, user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM warns WHERE chat_id=? AND user_id=?", (chat_id, user_id)
+        )
+        await db.commit()
+
+# ====== АНАЛИТИКА ======
+async def get_join_timestamps(chat_id, since=None):
+    """Возвращает список joined_at (unix) участников, опционально за период since..now."""
+    q = "SELECT joined_at FROM members WHERE chat_id=?"
+    params = [chat_id]
+    if since is not None:
+        q += " AND joined_at>=?"
+        params.append(since)
+    q += " ORDER BY joined_at"
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(q, params) as cur:
+            return [r[0] for r in await cur.fetchall()]
+
+
+async def get_all_members(chat_id):
+    """Полный список участников чата для выгрузки в CSV."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT user_id, full_name, username, joined_at FROM members "
+            "WHERE chat_id=? ORDER BY joined_at", (chat_id,)
+        ) as cur:
+            return await cur.fetchall()

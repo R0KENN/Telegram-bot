@@ -12,7 +12,18 @@ from handlers import router
 from scheduler import scheduler
 from commands import setup_commands
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+    handlers=[
+        logging.StreamHandler(),                       # вывод в консоль
+        logging.FileHandler("bot.log", encoding="utf-8"),  # дублирование в файл
+    ],
+)
+# Понижаем «болтливость» библиотек, чтобы лог не был засорён
+logging.getLogger("aiogram.event").setLevel(logging.WARNING)
+logging.getLogger("aiosqlite").setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
 
 

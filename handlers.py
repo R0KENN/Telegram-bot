@@ -1,30 +1,49 @@
 import asyncio
+import logging
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import urlparse
+import csv
+import io
+from collections import defaultdict
 
 from aiogram import Router, F
 from aiogram.types import (
     ChatJoinRequest, Message, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton, ChatMemberUpdated,
-    ReactionTypeEmoji
+    ReactionTypeEmoji, ChatPermissions, BufferedInputFile
 )
 from aiogram.filters import Command
 from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.enums import ChatType
+from aiogram.enums import ChatType, ContentType
+
+import matplotlib
+matplotlib.use("Agg")  # backend без GUI — обязательно до импорта pyplot
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
 import database as db
 import keyboards as kb
 from config import ADMIN_ID, TZ, TIMEZONE_OFFSET, BROADCAST_PAUSE
 
+logger = logging.getLogger(__name__)
 router = Router()
 # Подхваченные кастомные реакции по постам: {(chat_id, message_id): custom_emoji_id}
 _custom_reactions: dict[tuple[int, int], str] = {}
 # Каналы, по которым прямо сейчас идёт перебор /reactall (защита от повторного запуска)
 _reactall_running: set[int] = set()
+# Кэш админов чатов: {chat_id: (set_of_admin_ids, timestamp)}
+_admin_cache: dict[int, tuple[set[int], float]] = {}
+_ADMIN_CACHE_TTL = 300  # секунд — обновляем список админов раз в 5 минут
+# Ожидают прохождения капчи: {(chat_id, user_id): captcha_message_id}
+_captcha_pending: dict[tuple[int, int], int] = {}
+# Антифлуд: история времени сообщений {(chat_id, user_id): [timestamp, timestamp, ...]}
+_flood_tracker: dict[tuple[int, int], list[float]] = {}
+# Кого уже замутили за флуд — чтобы не мутить повторно каждым сообщением
+_flood_muted: set[tuple[int, int]] = set()
 
 URL_RE = re.compile(r'(https?://[^\s]+|www\.[^\s]+|t\.me/[^\s]+|@\w+)', re.IGNORECASE)
 
@@ -42,11 +61,41 @@ class Form(StatesGroup):
     gw_ttl = State()
     domain = State()
     word = State()
-    log_chat = State()
+    route_log_chat = State()
+    captcha_time = State()
+    warn_mute_limit = State()
+    warn_ban_limit = State()
+    warn_mute_minutes = State()
+    flood_count = State()
+    flood_window = State()
+    flood_minutes = State()
 
 
 def is_admin_id(uid):
     return uid == ADMIN_ID
+
+async def safe_send(bot, chat_id, text, **kwargs):
+    """
+    Безопасная отправка сообщения: при флуд-лимите Telegram ждёт и повторяет один раз.
+    Возвращает True при успехе, False при провале (заблокирован, нет прав и т.п.).
+    """
+    try:
+        await bot.send_message(chat_id, text, **kwargs)
+        return True
+    except TelegramRetryAfter as e:
+        logger.info("Флуд-лимит, ждём %s сек перед повтором для %s", e.retry_after, chat_id)
+        await asyncio.sleep(e.retry_after)
+        try:
+            await bot.send_message(chat_id, text, **kwargs)
+            return True
+        except Exception as e2:
+            logger.warning("Повтор отправки в %s не удался: %s", chat_id, e2)
+            return False
+    except TelegramForbiddenError:
+        return False  # пользователь заблокировал бота — это ожидаемо, не логируем
+    except Exception as e:
+        logger.warning("Не удалось отправить сообщение в %s: %s", chat_id, e)
+        return False
 
 async def send_chat_log(bot, chat_id, text, reply_markup=None):
 
@@ -87,31 +136,8 @@ async def send_chat_log(bot, chat_id, text, reply_markup=None):
     # fallback в личку
     try:
         await bot.send_message(ADMIN_ID, text, reply_markup=reply_markup)
-    except Exception:
-        pass
-
-async def send_to_topic(bot, chat_id, event_key, text, reply_markup=None):
-    """
-    Отправляет уведомление в тему лог-группы, привязанную к event_key.
-    Если маршрут не настроен — шлёт админу в личку (старое поведение).
-    chat_id — id управляемого канала/группы, к которому относится событие.
-    """
-    log_chat = await db.get_log_chat(chat_id)
-    thread_id = await db.get_topic_route(chat_id, event_key)
-    if log_chat and thread_id:
-        try:
-            await bot.send_message(
-                log_chat, text,
-                message_thread_id=thread_id,
-                reply_markup=reply_markup,
-            )
-            return
-        except Exception:
-            pass  # тема удалена / нет прав — падаем в fallback ниже
-    try:
-        await bot.send_message(ADMIN_ID, text, reply_markup=reply_markup)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error("Не удалось доставить лог даже в личку админу: %s", e)
 
 async def ensure_log_topic(bot, chat_id, title, force=False):
     if await db.get_setting(chat_id, "log_disabled") == "1":
@@ -136,7 +162,9 @@ async def ensure_log_topic(bot, chat_id, title, force=False):
 
     try:
         topic = await bot.create_forum_topic(chat_id=log_chat, name=title[:128])
-    except Exception:
+    except Exception as e:
+        logger.warning("Не удалось создать тему в лог-группе %s для чата %s: %s",
+                       log_chat, chat_id, e)
         return None  # нет прав / режим тем выключен
 
     thread_id = topic.message_thread_id
@@ -255,8 +283,10 @@ async def _put_reaction(bot, chat_id, message_id, emoji):
     except TelegramRetryAfter as e:
         await asyncio.sleep(e.retry_after)
         return False
-    except Exception:
+    except Exception as e:
         # удалённое/сервисное/несуществующее сообщение или нет прав
+        logger.warning("Не удалось поставить реакцию в чат %s на сообщение %s: %s",
+                       chat_id, message_id, e)
         return False
 
 
@@ -520,12 +550,128 @@ async def send_delayed_welcome(bot, chat_id, user_id):
 #              МОДЕРАЦИЯ ГРУПП + ПРИВЕТСТВИЕ В ГРУППЕ
 # ============================================================
 async def is_user_admin(bot, chat_id, user_id):
+    """Проверяет, админ ли пользователь. Список админов чата кэшируется на 5 минут."""
+    cached = _admin_cache.get(chat_id)
+    if cached and (time.time() - cached[1]) < _ADMIN_CACHE_TTL:
+        return user_id in cached[0]
+    # кэш протух или его нет — запрашиваем заново
     try:
-        m = await bot.get_chat_member(chat_id, user_id)
-        return m.status in ("administrator", "creator")
-    except Exception:
+        admins = await bot.get_chat_administrators(chat_id)
+        admin_ids = {a.user.id for a in admins}
+        _admin_cache[chat_id] = (admin_ids, time.time())
+        return user_id in admin_ids
+    except Exception as e:
+        logger.warning("Не удалось получить админов чата %s: %s", chat_id, e)
+        # при ошибке не блокируем работу — считаем, что не админ
         return False
 
+async def issue_warn(bot, chat_id, user, reason="нарушение"):
+    """
+    Выдаёт предупреждение пользователю и применяет наказание при достижении порога.
+    user — объект пользователя (у него есть .id и .full_name).
+    Возвращает текущее число предупреждений.
+    """
+    count = await db.add_warn(chat_id, user.id)
+    mute_limit = int(await db.get_setting(chat_id, "warn_mute_limit"))
+    ban_limit = int(await db.get_setting(chat_id, "warn_ban_limit"))
+    mute_minutes = int(await db.get_setting(chat_id, "warn_mute_minutes"))
+
+    note = ""
+    # Бан имеет приоритет (порог выше)
+    if count >= ban_limit:
+        try:
+            await bot.ban_chat_member(chat_id, user.id)
+            note = f"\n🚫 Достигнут лимit ({ban_limit}) — пользователь забанен."
+            await db.reset_warns(chat_id, user.id)
+        except Exception as e:
+            logger.warning("Не удалось забанить %s в %s: %s", user.id, chat_id, e)
+    elif count >= mute_limit:
+        try:
+            until = datetime.now(TZ) + timedelta(minutes=mute_minutes)
+            await bot.restrict_chat_member(
+                chat_id, user.id,
+                permissions=ChatPermissions(can_send_messages=False),
+                until_date=until,
+            )
+            note = f"\n🔇 Достигнут лимит ({mute_limit}) — мут на {mute_minutes} мин."
+        except Exception as e:
+            logger.warning("Не удалось замутить %s в %s: %s", user.id, chat_id, e)
+
+    await send_chat_log(
+        bot, chat_id,
+        f"⚠️ Предупреждение для {user.full_name} "
+        f"(<code>{user.id}</code>): {reason}\n"
+        f"Всего предупреждений: {count}.{note}"
+    )
+    return count
+
+async def check_flood(message: Message) -> bool:
+    """
+    Проверяет, флудит ли пользователь. Если да — мутит на короткий срок,
+    удаляет сообщение и возвращает True (значит, сообщение уже обработано).
+    """
+    chat_id = message.chat.id
+    if await db.get_setting(chat_id, "antiflood_enabled") != "1":
+        return False
+    user = message.from_user
+    key = (chat_id, user.id)
+
+    limit = int(await db.get_setting(chat_id, "antiflood_count"))
+    window = int(await db.get_setting(chat_id, "antiflood_window"))
+    now = time.time()
+
+    # Берём историю и выкидываем всё, что старше окна
+    history = _flood_tracker.get(key, [])
+    history = [t for t in history if now - t < window]
+    history.append(now)
+    _flood_tracker[key] = history
+
+    if len(history) < limit:
+        return False  # флуда нет
+
+    # Флуд обнаружен — мутим (если ещё не замутили)
+    if key in _flood_muted:
+        # уже замучен, просто чистим лишнее сообщение
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        return True
+
+    _flood_muted.add(key)
+    mute_minutes = int(await db.get_setting(chat_id, "antiflood_mute_minutes"))
+    try:
+        until = datetime.now(TZ) + timedelta(minutes=mute_minutes)
+        await message.bot.restrict_chat_member(
+            chat_id, user.id,
+            permissions=ChatPermissions(can_send_messages=False),
+            until_date=until,
+        )
+    except Exception as e:
+        logger.warning("Антифлуд: не удалось замутить %s в %s: %s", user.id, chat_id, e)
+        _flood_muted.discard(key)  # не вышло — снимаем флаг, попробуем в следующий раз
+        return True
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    # Сбрасываем историю и снимаем флаг мута через окно времени
+    _flood_tracker.pop(key, None)
+    asyncio.create_task(_clear_flood_flag(key, mute_minutes * 60))
+
+    await send_chat_log(
+        message.bot, chat_id,
+        f"🌊 Антифлуд: {user.full_name} (<code>{user.id}</code>) "
+        f"замучен на {mute_minutes} мин за флуд."
+    )
+    return True
+
+
+async def _clear_flood_flag(key, delay):
+    """Снимает флаг мута за флуд после истечения мута, чтобы при повторе снова сработало."""
+    await asyncio.sleep(delay)
+    _flood_muted.discard(key)
 
 
 # ============================================================
@@ -547,7 +693,8 @@ async def cmd_newtopic(message: Message):
             f"Тема «{name}» создана 🎉",
             message_thread_id=topic.message_thread_id,
         )
-    except Exception:
+    except Exception as e:
+        logger.warning("Ошибка создания темы в %s: %s", message.chat.id, e)
         await message.reply(
             "Не удалось создать тему. Проверь, что в группе включён режим тем "
             "и у бота есть право «Управление темами»."
@@ -589,6 +736,278 @@ async def cmd_deltopic(message: Message):
             await db.delete_topic(db_id, message.chat.id)
     await message.reply("Тема удалена.")
 
+# ============================================================
+#              КОМАНДЫ ПРЕДУПРЕЖДЕНИЙ (в группах)
+# ============================================================
+@router.message(Command("warn"), F.chat.type.in_({"group", "supergroup"}))
+async def cmd_warn(message: Message):
+    if not await is_user_admin(message.bot, message.chat.id, message.from_user.id):
+        return
+    if not message.reply_to_message or not message.reply_to_message.from_user:
+        await message.reply("Ответь этой командой на сообщение нарушителя.")
+        return
+    target = message.reply_to_message.from_user
+    if target.is_bot:
+        await message.reply("Боту предупреждение не выдать.")
+        return
+    if await is_user_admin(message.bot, message.chat.id, target.id):
+        await message.reply("Это админ — предупреждение не выдаётся.")
+        return
+    reason = message.text.removeprefix("/warn").strip() or "вручную админом"
+    count = await issue_warn(message.bot, message.chat.id, target, reason)
+    await message.reply(f"⚠️ {target.full_name}: предупреждение выдано. Всего: {count}.")
+
+
+@router.message(Command("unwarn"), F.chat.type.in_({"group", "supergroup"}))
+async def cmd_unwarn(message: Message):
+    if not await is_user_admin(message.bot, message.chat.id, message.from_user.id):
+        return
+    if not message.reply_to_message or not message.reply_to_message.from_user:
+        await message.reply("Ответь этой командой на сообщение пользователя.")
+        return
+    target = message.reply_to_message.from_user
+    count = await db.remove_warn(message.chat.id, target.id)
+    await message.reply(f"➖ {target.full_name}: снято одно предупреждение. Осталось: {count}.")
+
+
+@router.message(Command("warns"), F.chat.type.in_({"group", "supergroup"}))
+async def cmd_warns(message: Message):
+    if not await is_user_admin(message.bot, message.chat.id, message.from_user.id):
+        return
+    if not message.reply_to_message or not message.reply_to_message.from_user:
+        await message.reply("Ответь этой командой на сообщение пользователя.")
+        return
+    target = message.reply_to_message.from_user
+    count = await db.get_warns(message.chat.id, target.id)
+    await message.reply(f"📋 {target.full_name}: предупреждений — {count}.")
+
+
+@router.message(Command("resetwarns"), F.chat.type.in_({"group", "supergroup"}))
+async def cmd_resetwarns(message: Message):
+    if not await is_user_admin(message.bot, message.chat.id, message.from_user.id):
+        return
+    if not message.reply_to_message or not message.reply_to_message.from_user:
+        await message.reply("Ответь этой командой на сообщение пользователя.")
+        return
+    target = message.reply_to_message.from_user
+    await db.reset_warns(message.chat.id, target.id)
+    await message.reply(f"🧹 {target.full_name}: все предупреждения сброшены.")
+
+# ============================================================
+#           НАСТРОЙКА ПРЕДУПРЕЖДЕНИЙ (меню)
+# ============================================================
+@router.callback_query(F.data.startswith("warns_menu:"))
+async def cb_warns_menu(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    chat_id = int(c.data.split(":")[1])
+    await c.message.edit_text(
+        "⚠️ <b>Настройка предупреждений</b>\n\n"
+        "Когда у пользователя накапливается заданное число предупреждений, "
+        "бот автоматически мутит или банит его.\n\n"
+        "Выдавать варны можно вручную (/warn ответом) или автоматически "
+        "при срабатывании фильтров модерации.",
+        reply_markup=await kb.warns_menu_kb(chat_id)
+    )
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("wtogglemod:"))
+async def cb_warn_toggle_mod(c: CallbackQuery):
+    chat_id = int(c.data.split(":")[1])
+    cur = await db.get_setting(chat_id, "warn_on_moderation")
+    await db.set_setting(chat_id, "warn_on_moderation", "0" if cur == "1" else "1")
+    await c.message.edit_reply_markup(reply_markup=await kb.warns_menu_kb(chat_id))
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("wsetmute:"))
+async def cb_warn_set_mute(c: CallbackQuery, state: FSMContext):
+    chat_id = int(c.data.split(":")[1])
+    await state.update_data(chat_id=chat_id)
+    await state.set_state(Form.warn_mute_limit)
+    await c.message.edit_text(
+        "🔇 После скольки предупреждений мутить? (например: 3)",
+        reply_markup=kb.back_kb(f"warns_menu:{chat_id}")
+    )
+    await c.answer()
+
+
+@router.message(Form.warn_mute_limit)
+async def in_warn_mute_limit(message: Message, state: FSMContext):
+    if not is_admin_id(message.from_user.id):
+        return
+    if not message.text.strip().isdigit() or int(message.text.strip()) < 1:
+        await message.answer("Нужно целое число не меньше 1.")
+        return
+    data = await state.get_data()
+    cid = data["chat_id"]
+    await db.set_setting(cid, "warn_mute_limit", message.text.strip())
+    await state.clear()
+    await message.answer("✅ Порог мута обновлён.", reply_markup=await kb.warns_menu_kb(cid))
+
+
+@router.callback_query(F.data.startswith("wsetban:"))
+async def cb_warn_set_ban(c: CallbackQuery, state: FSMContext):
+    chat_id = int(c.data.split(":")[1])
+    await state.update_data(chat_id=chat_id)
+    await state.set_state(Form.warn_ban_limit)
+    await c.message.edit_text(
+        "🚫 После скольки предупреждений банить? (например: 5)\n"
+        "Должно быть больше порога мута.",
+        reply_markup=kb.back_kb(f"warns_menu:{chat_id}")
+    )
+    await c.answer()
+
+
+@router.message(Form.warn_ban_limit)
+async def in_warn_ban_limit(message: Message, state: FSMContext):
+    if not is_admin_id(message.from_user.id):
+        return
+    if not message.text.strip().isdigit() or int(message.text.strip()) < 1:
+        await message.answer("Нужно целое число не меньше 1.")
+        return
+    data = await state.get_data()
+    cid = data["chat_id"]
+    new_ban = int(message.text.strip())
+    mute_limit = int(await db.get_setting(cid, "warn_mute_limit"))
+    if new_ban <= mute_limit:
+        await message.answer(
+            f"Порог бана ({new_ban}) должен быть больше порога мута ({mute_limit}). "
+            f"Сначала измени порог мута или введи большее число."
+        )
+        return
+    await db.set_setting(cid, "warn_ban_limit", message.text.strip())
+    await state.clear()
+    await message.answer("✅ Порог бана обновлён.", reply_markup=await kb.warns_menu_kb(cid))
+
+
+@router.callback_query(F.data.startswith("wsetminutes:"))
+async def cb_warn_set_minutes(c: CallbackQuery, state: FSMContext):
+    chat_id = int(c.data.split(":")[1])
+    await state.update_data(chat_id=chat_id)
+    await state.set_state(Form.warn_mute_minutes)
+    await c.message.edit_text(
+        "⏱ На сколько минут мутить при достижении порога? (например: 60)",
+        reply_markup=kb.back_kb(f"warns_menu:{chat_id}")
+    )
+    await c.answer()
+
+
+@router.message(Form.warn_mute_minutes)
+async def in_warn_mute_minutes(message: Message, state: FSMContext):
+    if not is_admin_id(message.from_user.id):
+        return
+    if not message.text.strip().isdigit() or int(message.text.strip()) < 1:
+        await message.answer("Нужно целое число не меньше 1 (минут).")
+        return
+    data = await state.get_data()
+    cid = data["chat_id"]
+    await db.set_setting(cid, "warn_mute_minutes", message.text.strip())
+    await state.clear()
+    await message.answer("✅ Длительность мута обновлена.", reply_markup=await kb.warns_menu_kb(cid))
+
+# ============================================================
+#                   АНТИФЛУД (меню)
+# ============================================================
+@router.callback_query(F.data.startswith("flood_menu:"))
+async def cb_flood_menu(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    chat_id = int(c.data.split(":")[1])
+    await c.message.edit_text(
+        "🌊 <b>Антифлуд</b>\n\n"
+        "Если пользователь отправляет слишком много сообщений за короткое время, "
+        "бот мутит его на заданный срок и удаляет лишнее сообщение.\n\n"
+        "⚠️ Боту нужно право ограничивать участников.",
+        reply_markup=await kb.flood_menu_kb(chat_id)
+    )
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("floodtoggle:"))
+async def cb_flood_toggle(c: CallbackQuery):
+    chat_id = int(c.data.split(":")[1])
+    cur = await db.get_setting(chat_id, "antiflood_enabled")
+    await db.set_setting(chat_id, "antiflood_enabled", "0" if cur == "1" else "1")
+    await c.message.edit_reply_markup(reply_markup=await kb.flood_menu_kb(chat_id))
+    await c.answer("Антифлуд " + ("выключен" if cur == "1" else "включён"))
+
+
+@router.callback_query(F.data.startswith("floodcount:"))
+async def cb_flood_count(c: CallbackQuery, state: FSMContext):
+    chat_id = int(c.data.split(":")[1])
+    await state.update_data(chat_id=chat_id)
+    await state.set_state(Form.flood_count)
+    await c.message.edit_text(
+        "📊 Сколько сообщений считать флудом? (например: 5)",
+        reply_markup=kb.back_kb(f"flood_menu:{chat_id}")
+    )
+    await c.answer()
+
+
+@router.message(Form.flood_count)
+async def in_flood_count(message: Message, state: FSMContext):
+    if not is_admin_id(message.from_user.id):
+        return
+    if not message.text.strip().isdigit() or int(message.text.strip()) < 2:
+        await message.answer("Нужно целое число не меньше 2.")
+        return
+    data = await state.get_data()
+    cid = data["chat_id"]
+    await db.set_setting(cid, "antiflood_count", message.text.strip())
+    await state.clear()
+    await message.answer("✅ Лимит обновлён.", reply_markup=await kb.flood_menu_kb(cid))
+
+
+@router.callback_query(F.data.startswith("floodwindow:"))
+async def cb_flood_window(c: CallbackQuery, state: FSMContext):
+    chat_id = int(c.data.split(":")[1])
+    await state.update_data(chat_id=chat_id)
+    await state.set_state(Form.flood_window)
+    await c.message.edit_text(
+        "⏱ За сколько секунд считать сообщения? (например: 7)",
+        reply_markup=kb.back_kb(f"flood_menu:{chat_id}")
+    )
+    await c.answer()
+
+
+@router.message(Form.flood_window)
+async def in_flood_window(message: Message, state: FSMContext):
+    if not is_admin_id(message.from_user.id):
+        return
+    if not message.text.strip().isdigit() or int(message.text.strip()) < 1:
+        await message.answer("Нужно целое число не меньше 1 (секунд).")
+        return
+    data = await state.get_data()
+    cid = data["chat_id"]
+    await db.set_setting(cid, "antiflood_window", message.text.strip())
+    await state.clear()
+    await message.answer("✅ Окно обновлено.", reply_markup=await kb.flood_menu_kb(cid))
+
+
+@router.callback_query(F.data.startswith("floodminutes:"))
+async def cb_flood_minutes(c: CallbackQuery, state: FSMContext):
+    chat_id = int(c.data.split(":")[1])
+    await state.update_data(chat_id=chat_id)
+    await state.set_state(Form.flood_minutes)
+    await c.message.edit_text(
+        "🔇 На сколько минут мутить флудера? (например: 5)",
+        reply_markup=kb.back_kb(f"flood_menu:{chat_id}")
+    )
+    await c.answer()
+
+
+@router.message(Form.flood_minutes)
+async def in_flood_minutes(message: Message, state: FSMContext):
+    if not is_admin_id(message.from_user.id):
+        return
+    if not message.text.strip().isdigit() or int(message.text.strip()) < 1:
+        await message.answer("Нужно целое число не меньше 1 (минут).")
+        return
+    data = await state.get_data()
+    cid = data["chat_id"]
+    await db.set_setting(cid, "antiflood_mute_minutes", message.text.strip())
+    await state.clear()
+    await message.answer("✅ Длительность мута обновлена.", reply_markup=await kb.flood_menu_kb(cid))
 
 def extract_domains(text):
     domains = []
@@ -638,10 +1057,12 @@ async def on_new_member(message: Message):
             await message.delete()
         except Exception:
             pass
-    if await db.get_setting(chat_id, "group_welcome_enabled") != "1":
-        return
+
+    captcha_on = await db.get_setting(chat_id, "captcha_enabled") == "1"
+    welcome_on = await db.get_setting(chat_id, "group_welcome_enabled") == "1"
     text_tmpl = await db.get_setting(chat_id, "group_welcome_text")
     ttl = int(await db.get_setting(chat_id, "group_welcome_ttl"))
+
     for member in message.new_chat_members:
         if member.is_bot:
             continue
@@ -651,13 +1072,22 @@ async def on_new_member(message: Message):
             f"➕ Новый участник: {member.full_name} | "
             f"@{member.username or '—'} | <code>{member.id}</code>"
         )
-        text = text_tmpl.replace("{name}", member.full_name)
-        try:
-            sent = await message.answer(text)
-            if ttl > 0:
-                asyncio.create_task(delete_later(message.bot, chat_id, sent.message_id, ttl))
-        except Exception:
-            pass
+
+        # Капча: ограничиваем и просим нажать кнопку
+        if captcha_on:
+            started = await _start_captcha(message, chat_id, member)
+            if started:
+                continue  # пока не пройдёт капчу — обычное приветствие не шлём
+
+        # Обычное приветствие (если капча выключена или не сработала)
+        if welcome_on:
+            text = text_tmpl.replace("{name}", member.full_name)
+            try:
+                sent = await message.answer(text)
+                if ttl > 0:
+                    asyncio.create_task(delete_later(message.bot, chat_id, sent.message_id, ttl))
+            except Exception:
+                pass
 
 
 async def delete_later(bot, chat_id, message_id, delay):
@@ -671,26 +1101,147 @@ async def delete_later(bot, chat_id, message_id, delay):
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
     F.content_type.in_({
-        "new_chat_members",
-        "left_chat_member",
-        "new_chat_title",
-        "new_chat_photo",
-        "delete_chat_photo",
-        "pinned_message",
-        "group_chat_created",
-        "supergroup_chat_created",
-        "channel_chat_created",
-        "message_auto_delete_timer_changed",
-        "video_chat_scheduled",
-        "video_chat_started",
-        "video_chat_ended",
-        "video_chat_participants_invited",
-        "forum_topic_created",
-        "forum_topic_edited",
-        "forum_topic_closed",
-        "forum_topic_reopened",
+        ContentType.NEW_CHAT_MEMBERS,
+        ContentType.LEFT_CHAT_MEMBER,
+        ContentType.NEW_CHAT_TITLE,
+        ContentType.NEW_CHAT_PHOTO,
+        ContentType.DELETE_CHAT_PHOTO,
+        ContentType.PINNED_MESSAGE,
+        ContentType.GROUP_CHAT_CREATED,
+        ContentType.SUPERGROUP_CHAT_CREATED,
+        ContentType.CHANNEL_CHAT_CREATED,
+        ContentType.MESSAGE_AUTO_DELETE_TIMER_CHANGED,
+        ContentType.VIDEO_CHAT_SCHEDULED,
+        ContentType.VIDEO_CHAT_STARTED,
+        ContentType.VIDEO_CHAT_ENDED,
+        ContentType.VIDEO_CHAT_PARTICIPANTS_INVITED,
+        ContentType.FORUM_TOPIC_CREATED,
+        ContentType.FORUM_TOPIC_EDITED,
+        ContentType.FORUM_TOPIC_CLOSED,
+        ContentType.FORUM_TOPIC_REOPENED,
     }),
 )
+
+async def _start_captcha(message: Message, chat_id, member):
+    """
+    Ограничивает новичку право писать и шлёт капчу с кнопкой.
+    Возвращает True, если капча реально выставлена (бот смог ограничить).
+    """
+    bot = message.bot
+    # 1) Забираем право писать
+    try:
+        await bot.restrict_chat_member(
+            chat_id, member.id,
+            permissions=ChatPermissions(can_send_messages=False),
+        )
+    except Exception as e:
+        # Бот не админ / нет права ограничивать — капчу не применяем
+        logger.warning("Капча в %s: не удалось ограничить пользователя %s: %s",
+                       chat_id, member.id, e)
+        return False
+
+    # 2) Шлём сообщение с кнопкой
+    timeout = int(await db.get_setting(chat_id, "captcha_timeout"))
+    kb_captcha = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Я не бот", callback_data=f"cap:{chat_id}:{member.id}")]
+    ])
+    try:
+        sent = await message.answer(
+            f"👋 {member.full_name}, подтверди, что ты человек — нажми кнопку ниже "
+            f"в течение {timeout} сек, иначе будешь удалён.",
+            reply_markup=kb_captcha,
+        )
+    except Exception as e:
+        logger.warning("Капча в %s: не удалось отправить сообщение: %s", chat_id, e)
+        return False
+
+    # 3) Запоминаем и запускаем таймер
+    _captcha_pending[(chat_id, member.id)] = sent.message_id
+    asyncio.create_task(_captcha_timeout(bot, chat_id, member.id, timeout))
+    return True
+
+
+async def _captcha_timeout(bot, chat_id, user_id, timeout):
+    """Ждёт timeout секунд. Если капча не пройдена — наказывает по настройке."""
+    await asyncio.sleep(timeout)
+    cap_msg_id = _captcha_pending.pop((chat_id, user_id), None)
+    if cap_msg_id is None:
+        return  # уже прошёл капчу — ничего не делаем
+
+    # Удаляем сообщение капчи
+    try:
+        await bot.delete_message(chat_id, cap_msg_id)
+    except Exception:
+        pass
+
+    action = await db.get_setting(chat_id, "captcha_action")
+    if action == "kick":
+        try:
+            await bot.ban_chat_member(chat_id, user_id)
+            await bot.unban_chat_member(chat_id, user_id)  # разбан, чтобы мог зайти заново
+        except Exception as e:
+            logger.warning("Капча в %s: не удалось кикнуть %s: %s", chat_id, user_id, e)
+    # если action == "mute" — просто оставляем без права писать (он уже ограничен)
+
+    await send_chat_log(
+        bot, chat_id,
+        f"🤖 Пользователь <code>{user_id}</code> не прошёл капчу "
+        f"({'кикнут' if action == 'kick' else 'оставлен без права писать'})."
+    )
+
+
+@router.callback_query(F.data.startswith("cap:"))
+async def cb_captcha_pass(c: CallbackQuery):
+    """Нажатие кнопки 'Я не бот'. Реагировать может только сам новичок."""
+    _, chat_id, user_id = c.data.split(":")
+    chat_id, user_id = int(chat_id), int(user_id)
+
+    # Кнопку должен нажать тот, для кого капча
+    if c.from_user.id != user_id:
+        await c.answer("Это не твоя капча 🙂", show_alert=True)
+        return
+
+    # Снимаем ограничение — возвращаем стандартные права
+    try:
+        await c.bot.restrict_chat_member(
+            chat_id, user_id,
+            permissions=ChatPermissions(
+                can_send_messages=True,
+                can_send_audios=True,
+                can_send_documents=True,
+                can_send_photos=True,
+                can_send_videos=True,
+                can_send_video_notes=True,
+                can_send_voice_notes=True,
+                can_send_polls=True,
+                can_send_other_messages=True,
+                can_add_web_page_previews=True,
+            ),
+        )
+    except Exception as e:
+        logger.warning("Капча в %s: не удалось вернуть права %s: %s", chat_id, user_id, e)
+
+    # Убираем из ожидания и удаляем сообщение капчи
+    _captcha_pending.pop((chat_id, user_id), None)
+    try:
+        await c.message.delete()
+    except Exception:
+        pass
+
+    await c.answer("Добро пожаловать! ✅")
+
+    # Шлём обычное приветствие группы, если оно включено
+    if await db.get_setting(chat_id, "group_welcome_enabled") == "1":
+        text_tmpl = await db.get_setting(chat_id, "group_welcome_text")
+        ttl = int(await db.get_setting(chat_id, "group_welcome_ttl"))
+        text = text_tmpl.replace("{name}", c.from_user.full_name)
+        try:
+            sent = await c.bot.send_message(chat_id, text)
+            if ttl > 0:
+                asyncio.create_task(delete_later(c.bot, chat_id, sent.message_id, ttl))
+        except Exception:
+            pass
+
 async def clean_service_messages(message: Message):
     chat_id = message.chat.id
     if await db.get_setting(chat_id, "clean_service") != "1":
@@ -718,6 +1269,10 @@ async def moderate(message: Message):
     if await is_user_admin(message.bot, chat_id, message.from_user.id):
         return
 
+    # Антифлуд (до остальных проверок)
+    if await check_flood(message):
+        return
+
     text = message.text or message.caption or ""
 
     # Фильтр запрещённых слов
@@ -727,13 +1282,17 @@ async def moderate(message: Message):
         if any(w in low for w in banned):
             try:
                 await message.delete()
+            except Exception:
+                pass
+            if await db.get_setting(chat_id, "warn_on_moderation") == "1":
+                await issue_warn(message.bot, chat_id, message.from_user,
+                                 reason="запрещённое слово")
+            else:
                 await send_chat_log(
                     message.bot, chat_id,
                     f"🛡 Удалено сообщение от {message.from_user.full_name} "
                     f"(@{message.from_user.username or '—'})"
                 )
-            except Exception:
-                pass
             return
 
     # Удаление ссылок (кроме белого списка доменов)
@@ -747,15 +1306,123 @@ async def moderate(message: Message):
             if not all(is_allowed(h) for h in found):
                 try:
                     await message.delete()
-                    await send_chat_log(
-                message.bot, chat_id,
-                f"🛡 Удалено сообщение от {message.from_user.full_name} "
-                f"(@{message.from_user.username or '—'})"
-            )
                 except Exception:
                     pass
+                if await db.get_setting(chat_id, "warn_on_moderation") == "1":
+                    await issue_warn(message.bot, chat_id, message.from_user,
+                                     reason="запрещённая ссылка")
+                else:
+                    await send_chat_log(
+                        message.bot, chat_id,
+                        f"🛡 Удалено сообщение от {message.from_user.full_name} "
+                        f"(@{message.from_user.username or '—'})"
+                    )
                 return
 
+
+# ============================================================
+#                       АНАЛИТИКА
+# ============================================================
+def _build_growth_chart(timestamps, title, tz):
+    """
+    Синхронно строит PNG-график накопительного прироста по датам вступления.
+    Выполняется в отдельном потоке. Возвращает bytes (PNG) или None, если данных нет.
+    """
+    if not timestamps:
+        return None
+
+    # Группируем по дням (в нужном часовом поясе)
+    per_day = defaultdict(int)
+    for ts in timestamps:
+        day = datetime.fromtimestamp(ts, tz).date()
+        per_day[day] += 1
+
+    days = sorted(per_day.keys())
+    cumulative = []
+    running = 0
+    for d in days:
+        running += per_day[d]
+        cumulative.append(running)
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(days, cumulative, marker="o", linewidth=2, color="#2481cc")
+    ax.fill_between(days, cumulative, alpha=0.15, color="#2481cc")
+    ax.set_title(title)
+    ax.set_xlabel("Дата")
+    ax.set_ylabel("Всего участников (накопительно)")
+    ax.grid(True, linestyle="--", alpha=0.4)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%d.%m"))
+    fig.autofmt_xdate()
+    fig.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=100)
+    plt.close(fig)  # обязательно закрываем фигуру, иначе утечка памяти
+    buf.seek(0)
+    return buf.getvalue()
+
+
+@router.callback_query(F.data.startswith("chart:"))
+async def cb_chart(c: CallbackQuery):
+    if not is_admin_id(c.from_user.id):
+        await c.answer()
+        return
+    chat_id = int(c.data.split(":")[1])
+    chat = await db.get_chat(chat_id)
+    title = chat[1] if chat else str(chat_id)
+
+    timestamps = await db.get_join_timestamps(chat_id)
+    if not timestamps:
+        await c.answer("Пока нет данных для графика.", show_alert=True)
+        return
+
+    await c.answer("Строю график…")
+    # Тяжёлую отрисовку выносим в поток, чтобы не блокировать бота
+    png = await asyncio.to_thread(
+        _build_growth_chart, timestamps, f"Прирост: {title}", TZ
+    )
+    if not png:
+        await c.message.answer("Не удалось построить график.")
+        return
+
+    photo = BufferedInputFile(png, filename="growth.png")
+    await c.message.answer_photo(
+        photo,
+        caption=f"📈 Прирост участников «{title}» (всего {len(timestamps)})."
+    )
+
+
+@router.callback_query(F.data.startswith("export:"))
+async def cb_export(c: CallbackQuery):
+    if not is_admin_id(c.from_user.id):
+        await c.answer()
+        return
+    chat_id = int(c.data.split(":")[1])
+    chat = await db.get_chat(chat_id)
+    title = chat[1] if chat else str(chat_id)
+
+    rows = await db.get_all_members(chat_id)
+    if not rows:
+        await c.answer("Список участников пуст.", show_alert=True)
+        return
+
+    await c.answer("Готовлю файл…")
+
+    # Формируем CSV в памяти
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["user_id", "full_name", "username", "joined_at"])
+    for user_id, full_name, username, joined_at in rows:
+        when = datetime.fromtimestamp(joined_at, TZ).strftime("%Y-%m-%d %H:%M:%S")
+        writer.writerow([user_id, full_name or "", username or "", when])
+
+    # CSV с BOM, чтобы Excel корректно открыл кириллицу
+    data = ("\ufeff" + buf.getvalue()).encode("utf-8")
+    doc = BufferedInputFile(data, filename=f"members_{chat_id}.csv")
+    await c.message.answer_document(
+        doc,
+        caption=f"📄 Участники «{title}» — {len(rows)} записей."
+    )
 
 # ============================================================
 #                   МЕНЮ ЧАТА (общее)
@@ -864,7 +1531,7 @@ async def cb_logtopic(c: CallbackQuery, state: FSMContext):
 async def cb_setlogchat(c: CallbackQuery, state: FSMContext):
     chat_id = int(c.data.split(":")[1])
     await state.update_data(route_chat_id=chat_id)
-    await state.set_state(Form.log_chat)
+    await state.set_state(Form.route_log_chat)
     await c.message.edit_text(
         "Пришли ID супергруппы-лога (с включёнными темами).\n"
         "Это id вида <code>-100...</code>\n\n"
@@ -875,8 +1542,8 @@ async def cb_setlogchat(c: CallbackQuery, state: FSMContext):
     await c.answer()
 
 
-@router.message(Form.log_chat)
-async def in_log_chat(message: Message, state: FSMContext):
+@router.message(Form.route_log_chat)
+async def in_route_log_chat(message: Message, state: FSMContext):
     if not is_admin_id(message.from_user.id):
         return
     val = message.text.strip()
@@ -991,79 +1658,6 @@ async def cb_deltopicchat_ok(c: CallbackQuery):
         reply_markup=await kb.log_topic_kb(chat_id)
     )
     await c.answer("Удалено")
-
-# ============================================================
-#            МАРШРУТИЗАЦИЯ УВЕДОМЛЕНИЙ ПО ТЕМАМ
-# ============================================================
-@router.callback_query(F.data.startswith("routes:"))
-async def cb_routes(c: CallbackQuery, state: FSMContext):
-    await state.clear()
-    chat_id = int(c.data.split(":")[1])
-    await c.message.edit_text(
-        "🧵 <b>Темы для уведомлений</b>\n\n"
-        "Выбери, в какую тему лог-группы слать каждый тип событий.\n"
-        "Темы создаются командой /newtopic прямо в лог-группе.",
-        reply_markup=await kb.topics_route_kb(chat_id)
-    )
-    await c.answer()
-
-
-@router.callback_query(F.data.startswith("setloggrp:"))
-async def cb_setloggrp(c: CallbackQuery, state: FSMContext):
-    chat_id = int(c.data.split(":")[1])
-    await state.update_data(route_chat_id=chat_id)
-    await state.set_state(Form.log_chat)
-    await c.message.edit_text(
-        "Пришли ID супергруппы-лога (с темами), куда слать уведомления.\n"
-        "ID можно увидеть в /menu в списке чатов или это id вида -100...\n\n"
-        "Бот должен быть в этой группе админом с правом «Управление темами».",
-        reply_markup=kb.back_kb(f"routes:{chat_id}")
-    )
-    await c.answer()
-
-
-@router.message(Form.log_chat)
-async def in_log_chat(message: Message, state: FSMContext):
-    if not is_admin_id(message.from_user.id):
-        return
-    val = message.text.strip()
-    if not val.lstrip("-").isdigit():
-        await message.answer("Нужен числовой ID группы (например -1001234567890).")
-        return
-    data = await state.get_data()
-    cid = data["route_chat_id"]
-    await db.set_log_chat(cid, int(val))
-    await state.clear()
-    await message.answer(
-        "✅ Лог-группа сохранена.",
-        reply_markup=await kb.topics_route_kb(cid)
-    )
-
-
-@router.callback_query(F.data.startswith("pickroute:"))
-async def cb_pickroute(c: CallbackQuery):
-    _, chat_id, event_key = c.data.split(":")
-    chat_id = int(chat_id)
-    log_chat = await db.get_log_chat(chat_id)
-    if not log_chat:
-        await c.answer("Сначала выбери лог-группу.", show_alert=True)
-        return
-    await c.message.edit_text(
-        "Выбери тему для этого типа уведомлений:",
-        reply_markup=await kb.topic_choice_kb(chat_id, event_key, log_chat)
-    )
-    await c.answer()
-
-
-@router.callback_query(F.data.startswith("setroute:"))
-async def cb_setroute(c: CallbackQuery):
-    _, chat_id, event_key, thread_id = c.data.split(":")
-    await db.set_topic_route(int(chat_id), event_key, int(thread_id))
-    await c.message.edit_text(
-        "🧵 <b>Темы для уведомлений</b>",
-        reply_markup=await kb.topics_route_kb(int(chat_id))
-    )
-    await c.answer("Тема привязана")
 
 @router.callback_query(F.data.startswith("delchat:"))
 async def cb_delchat(c: CallbackQuery):
@@ -1261,7 +1855,8 @@ async def cb_tcs(c: CallbackQuery):
     await c.answer("Чистка системных " + ("включена" if cur != "1" else "выключена"))
 
 @router.callback_query(F.data.startswith("reactions:"))
-async def cb_reactions(c: CallbackQuery):
+async def cb_reactions(c: CallbackQuery, state: FSMContext):
+    await state.clear()
     chat_id = int(c.data.split(":")[1])
     await c.message.edit_text(
         "🔥 <b>Реакции на посты канала</b>",
@@ -1471,6 +2066,66 @@ async def in_gw_ttl(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("✅ Обновлено.", reply_markup=await kb.group_welcome_kb(cid))
 
+# ============================================================
+#               КАПЧА ДЛЯ НОВИЧКОВ (меню)
+# ============================================================
+@router.callback_query(F.data.startswith("captcha:"))
+async def cb_captcha_menu(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    chat_id = int(c.data.split(":")[1])
+    await c.message.edit_text(
+        "🤖 <b>Капча для новичков</b>\n\n"
+        "Новый участник получает ограничение на запись и кнопку «Я не бот». "
+        "Не нажал вовремя — наказывается по настройке.\n\n"
+        "⚠️ Боту нужны права админа с возможностью ограничивать/банить участников.",
+        reply_markup=await kb.captcha_menu_kb(chat_id)
+    )
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("captoggle:"))
+async def cb_captcha_toggle(c: CallbackQuery):
+    chat_id = int(c.data.split(":")[1])
+    cur = await db.get_setting(chat_id, "captcha_enabled")
+    await db.set_setting(chat_id, "captcha_enabled", "0" if cur == "1" else "1")
+    await c.message.edit_reply_markup(reply_markup=await kb.captcha_menu_kb(chat_id))
+    await c.answer("Капча " + ("выключена" if cur == "1" else "включена"))
+
+
+@router.callback_query(F.data.startswith("capaction:"))
+async def cb_captcha_action(c: CallbackQuery):
+    chat_id = int(c.data.split(":")[1])
+    cur = await db.get_setting(chat_id, "captcha_action")
+    await db.set_setting(chat_id, "captcha_action", "mute" if cur == "kick" else "kick")
+    await c.message.edit_reply_markup(reply_markup=await kb.captcha_menu_kb(chat_id))
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("captime:"))
+async def cb_captcha_time(c: CallbackQuery, state: FSMContext):
+    chat_id = int(c.data.split(":")[1])
+    await state.update_data(chat_id=chat_id)
+    await state.set_state(Form.captcha_time)
+    await c.message.edit_text(
+        "⏱ Сколько секунд давать на прохождение капчи? (например: 120)",
+        reply_markup=kb.back_kb(f"captcha:{chat_id}")
+    )
+    await c.answer()
+
+
+@router.message(Form.captcha_time)
+async def in_captcha_time(message: Message, state: FSMContext):
+    if not is_admin_id(message.from_user.id):
+        return
+    if not message.text.strip().isdigit() or int(message.text.strip()) < 10:
+        await message.answer("Нужно число не меньше 10 (секунд).")
+        return
+    data = await state.get_data()
+    cid = data["chat_id"]
+    await db.set_setting(cid, "captcha_timeout", message.text.strip())
+    await state.clear()
+    await message.answer("✅ Время обновлено.", reply_markup=await kb.captcha_menu_kb(cid))
+
 
 # ============================================================
 #               РАССЫЛКА И ПОСТЫ (каналы)
@@ -1501,23 +2156,12 @@ async def in_broadcast(message: Message, state: FSMContext):
     sent, failed = 0, 0
     dead = []  # кто заблокировал бота — удалим из базы
     for uid in ids:
-        try:
-            await message.bot.send_message(uid, text)
+        ok = await safe_send(message.bot, uid, text)
+        if ok:
             sent += 1
-        except TelegramRetryAfter as e:
-            # Telegram просит подождать — ждём и повторяем этого же получателя
-            await asyncio.sleep(e.retry_after)
-            try:
-                await message.bot.send_message(uid, text)
-                sent += 1
-            except Exception:
-                failed += 1
-        except TelegramForbiddenError:
-            # пользователь заблокировал бота
-            dead.append(uid)
+        else:
             failed += 1
-        except TelegramBadRequest:
-            failed += 1
+            dead.append(uid)  # не доставили — кандидат на удаление из базы
         await asyncio.sleep(BROADCAST_PAUSE)
 
     if dead:
@@ -1607,6 +2251,13 @@ async def in_post_time(message: Message, state: FSMContext):
         return
     data = await state.get_data()
     cid = data["chat_id"]
+    await db.add_post(
+        cid,
+        data["post_text"],
+        data.get("btn_text"),
+        data.get("btn_url"),
+        pub,
+    )
     await state.clear()
     prefix = "✅ Запланировано на "
     placeholder = "—"
