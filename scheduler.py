@@ -2,8 +2,13 @@ import asyncio
 import logging
 import time
 
+import json
+
 from aiogram import Bot
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import (
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    InputMediaPhoto, InputMediaVideo, InputMediaDocument
+)
 
 import database as db
 from config import ADMIN_ID
@@ -31,6 +36,13 @@ async def scheduler(bot: Bot):
                     elif media_type == "document":
                         await bot.send_document(chat_id, media_id, caption=text or None,
                                                 reply_markup=keyboard)
+                    elif media_type == "album":
+                        media = _build_album(media_id, text)
+                        await bot.send_media_group(chat_id, media)
+                        # У альбома не бывает инлайн-кнопки — шлём её отдельным сообщением
+                        if keyboard:
+                            await bot.send_message(chat_id, text or "⬆️",
+                                                   reply_markup=keyboard)
                     else:
                         await bot.send_message(chat_id, text, reply_markup=keyboard)
 

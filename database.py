@@ -71,21 +71,25 @@ async def init_db():
                 PRIMARY KEY (chat_id, message_id)
             )
         """)
-                # Предупреждения пользователей
+        # Предупреждения пользователей
         await db.execute("""
             CREATE TABLE IF NOT EXISTS warns (
                 chat_id INTEGER, user_id INTEGER, count INTEGER DEFAULT 0,
                 PRIMARY KEY (chat_id, user_id)
             )
         """)
-    # --- миграция: медиа в постах ---
-    async with db.execute("PRAGMA table_info(posts)") as cur:
-        cols = [row[1] for row in await cur.fetchall()]
-    if "media_type" not in cols:
-        await db.execute("ALTER TABLE posts ADD COLUMN media_type TEXT")
-    if "media_id" not in cols:
-        await db.execute("ALTER TABLE posts ADD COLUMN media_id TEXT")
-    await db.commit()
+
+        # --- миграция: медиа и повтор в постах ---
+        async with db.execute("PRAGMA table_info(posts)") as cur:
+            cols = [row[1] for row in await cur.fetchall()]
+        if "media_type" not in cols:
+            await db.execute("ALTER TABLE posts ADD COLUMN media_type TEXT")
+        if "media_id" not in cols:
+            await db.execute("ALTER TABLE posts ADD COLUMN media_id TEXT")
+        if "repeat_mode" not in cols:
+            await db.execute("ALTER TABLE posts ADD COLUMN repeat_mode TEXT DEFAULT 'once'")
+
+        await db.commit()
 
 
 
@@ -208,12 +212,14 @@ async def remove_members(chat_id, user_ids):
 
 # ====== ПОСТЫ ======
 async def add_post(chat_id, text, btn_text, btn_url, publish_at,
-                   media_type=None, media_id=None):
+                   media_type=None, media_id=None, repeat_mode="once"):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO posts (chat_id, text, btn_text, btn_url, publish_at, status, media_type, media_id) "
-            "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
-            (chat_id, text, btn_text, btn_url, publish_at, media_type, media_id),
+            "INSERT INTO posts (chat_id, text, btn_text, btn_url, publish_at, status, "
+            "media_type, media_id, repeat_mode) "
+            "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
+            (chat_id, text, btn_text, btn_url, publish_at,
+             media_type, media_id, repeat_mode),
         )
         await db.commit()
 

@@ -6,13 +6,15 @@ from datetime import datetime, timedelta
 from urllib.parse import urlparse
 import csv
 import io
+import json
 from collections import defaultdict
 
 from aiogram import Router, F
 from aiogram.types import (
     ChatJoinRequest, Message, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton, ChatMemberUpdated,
-    ReactionTypeEmoji, ChatPermissions, BufferedInputFile
+    ReactionTypeEmoji, ChatPermissions, BufferedInputFile,
+    InputMediaPhoto, InputMediaVideo, InputMediaDocument
 )
 from aiogram.filters import Command
 from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest
@@ -44,6 +46,8 @@ _captcha_pending: dict[tuple[int, int], int] = {}
 _flood_tracker: dict[tuple[int, int], list[float]] = {}
 # Кого уже замутили за флуд — чтобы не мутить повторно каждым сообщением
 _flood_muted: set[tuple[int, int]] = set()
+# Буфер для сборки альбомов при создании поста: {media_group_id: {"items": [...], "task": Task, ...}}
+_album_buffer: dict[str, dict] = {}
 
 URL_RE = re.compile(r'(https?://[^\s]+|www\.[^\s]+|t\.me/[^\s]+|@\w+)', re.IGNORECASE)
 
@@ -55,8 +59,12 @@ class Form(StatesGroup):
     wbtn_url = State()
     broadcast = State()
     post_text = State()
+    post_media = State()
     post_button = State()
+    post_repeat = State()
     post_time = State()
+    edit_post_text = State()
+    edit_post_time = State()
     gw_text = State()
     gw_ttl = State()
     domain = State()
@@ -1097,30 +1105,6 @@ async def delete_later(bot, chat_id, message_id, delay):
     except Exception:
         pass
 
-# Очистка системных/сервисных сообщений в группах
-@router.message(
-    F.chat.type.in_({"group", "supergroup"}),
-    F.content_type.in_({
-        ContentType.NEW_CHAT_MEMBERS,
-        ContentType.LEFT_CHAT_MEMBER,
-        ContentType.NEW_CHAT_TITLE,
-        ContentType.NEW_CHAT_PHOTO,
-        ContentType.DELETE_CHAT_PHOTO,
-        ContentType.PINNED_MESSAGE,
-        ContentType.GROUP_CHAT_CREATED,
-        ContentType.SUPERGROUP_CHAT_CREATED,
-        ContentType.CHANNEL_CHAT_CREATED,
-        ContentType.MESSAGE_AUTO_DELETE_TIMER_CHANGED,
-        ContentType.VIDEO_CHAT_SCHEDULED,
-        ContentType.VIDEO_CHAT_STARTED,
-        ContentType.VIDEO_CHAT_ENDED,
-        ContentType.VIDEO_CHAT_PARTICIPANTS_INVITED,
-        ContentType.FORUM_TOPIC_CREATED,
-        ContentType.FORUM_TOPIC_EDITED,
-        ContentType.FORUM_TOPIC_CLOSED,
-        ContentType.FORUM_TOPIC_REOPENED,
-    }),
-)
 
 async def _start_captcha(message: Message, chat_id, member):
     """
@@ -1242,6 +1226,29 @@ async def cb_captcha_pass(c: CallbackQuery):
         except Exception:
             pass
 
+# Очистка системных/сервисных сообщений в группах
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.content_type.in_({
+        ContentType.LEFT_CHAT_MEMBER,
+        ContentType.NEW_CHAT_TITLE,
+        ContentType.NEW_CHAT_PHOTO,
+        ContentType.DELETE_CHAT_PHOTO,
+        ContentType.PINNED_MESSAGE,
+        ContentType.GROUP_CHAT_CREATED,
+        ContentType.SUPERGROUP_CHAT_CREATED,
+        ContentType.CHANNEL_CHAT_CREATED,
+        ContentType.MESSAGE_AUTO_DELETE_TIMER_CHANGED,
+        ContentType.VIDEO_CHAT_SCHEDULED,
+        ContentType.VIDEO_CHAT_STARTED,
+        ContentType.VIDEO_CHAT_ENDED,
+        ContentType.VIDEO_CHAT_PARTICIPANTS_INVITED,
+        ContentType.FORUM_TOPIC_CREATED,
+        ContentType.FORUM_TOPIC_EDITED,
+        ContentType.FORUM_TOPIC_CLOSED,
+        ContentType.FORUM_TOPIC_REOPENED,
+    }),
+)
 async def clean_service_messages(message: Message):
     chat_id = message.chat.id
     if await db.get_setting(chat_id, "clean_service") != "1":
@@ -2178,7 +2185,7 @@ async def in_broadcast(message: Message, state: FSMContext):
 async def cb_posts(c: CallbackQuery, state: FSMContext):
     await state.clear()
     chat_id = int(c.data.split(":")[1])
-    await c.message.edit_text("📝 <b>Отложенные посты</b>\nНажми, чтобы отменить.",
+    await c.message.edit_text("📝 <b>Отложенные посты</b>\nНажми на пост, чтобы открыть.",
                               reply_markup=await kb.posts_menu_kb(chat_id))
     await c.answer()
 
@@ -2186,10 +2193,13 @@ async def cb_posts(c: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data.startswith("newpost:"))
 async def cb_newpost(c: CallbackQuery, state: FSMContext):
     chat_id = int(c.data.split(":")[1])
-    await state.update_data(chat_id=chat_id)
+    await state.update_data(chat_id=chat_id, media_type=None, media_id=None)
     await state.set_state(Form.post_text)
-    await c.message.edit_text("📝 Шаг 1/3. Пришли текст поста.",
-                              reply_markup=kb.back_kb(f"posts:{chat_id}"))
+    await c.message.edit_text(
+        "📝 Шаг 1/4. Пришли текст поста, либо фото/видео/документ/альбом "
+        "(можно с подписью).",
+        reply_markup=kb.back_kb(f"posts:{chat_id}")
+    )
     await c.answer()
 
 
@@ -2197,22 +2207,108 @@ async def cb_newpost(c: CallbackQuery, state: FSMContext):
 async def in_post_text(message: Message, state: FSMContext):
     if not is_admin_id(message.from_user.id):
         return
-    await state.update_data(post_text=message.html_text)
+
     data = await state.get_data()
+    cid = data["chat_id"]
+
+    # --- АЛЬБОМ (несколько медиа с общим media_group_id) ---
+    if message.media_group_id:
+        mgid = message.media_group_id
+        item = _extract_media_item(message)
+        if item is None:
+            return  # неподдерживаемая часть альбома — игнорируем
+
+        buf = _album_buffer.get(mgid)
+        if buf is None:
+            buf = {"items": [], "task": None, "chat_id": cid,
+                   "user_id": message.from_user.id, "state": state}
+            _album_buffer[mgid] = buf
+        buf["items"].append(item)
+
+        # caption берём с первой части, где он есть
+        if message.caption and not buf.get("caption"):
+            buf["caption"] = message.html_text
+
+        # перезапускаем таймер сборки — ждём 1.5 сек после последней части
+        if buf["task"]:
+            buf["task"].cancel()
+        buf["task"] = asyncio.create_task(_finish_album(mgid, message))
+        return
+
+    # --- ОДИНОЧНОЕ МЕДИА ---
+    item = _extract_media_item(message)
+    if item is not None:
+        await state.update_data(
+            post_text=message.html_text if message.caption else "",
+            media_type=item["type"],
+            media_id=item["file_id"],
+        )
+        await _ask_post_button(message, cid, state)
+        return
+
+    # --- ПРОСТО ТЕКСТ ---
+    if message.text:
+        await state.update_data(
+            post_text=message.html_text,
+            media_type=None,
+            media_id=None,
+        )
+        await _ask_post_button(message, cid, state)
+        return
+
+    await message.answer("Пришли текст поста, либо фото/видео/документ/альбом.")
+
+
+def _extract_media_item(message: Message):
+    """Достаёт из сообщения тип медиа и file_id. Возвращает dict или None."""
+    if message.photo:
+        return {"type": "photo", "file_id": message.photo[-1].file_id}
+    if message.video:
+        return {"type": "video", "file_id": message.video.file_id}
+    if message.document:
+        return {"type": "document", "file_id": message.document.file_id}
+    return None
+
+
+async def _finish_album(mgid, message: Message):
+    """Срабатывает через паузу после последней части альбома — собирает всё вместе."""
+    try:
+        await asyncio.sleep(1.5)
+    except asyncio.CancelledError:
+        return  # пришла ещё одна часть — этот таймер отменён, ждём новый
+
+    buf = _album_buffer.pop(mgid, None)
+    if not buf:
+        return
+    state: FSMContext = buf["state"]
+    cid = buf["chat_id"]
+
+    # media_id для альбома — JSON-список объектов {type, file_id}
+    await state.update_data(
+        post_text=buf.get("caption", ""),
+        media_type="album",
+        media_id=json.dumps(buf["items"]),
+    )
+    await _ask_post_button(message, cid, state)
+
+
+async def _ask_post_button(message: Message, cid, state: FSMContext):
     await state.set_state(Form.post_button)
-    await message.answer("🔘 Шаг 2/3. Кнопка в формате: Название | https://ссылка\nИли «Без кнопки».",
-                         reply_markup=kb.skip_kb(data["chat_id"]))
+    await message.answer(
+        "🔘 Шаг 2/4. Кнопка в формате: Название | https://ссылка\n"
+        "Или нажми «Без кнопки».",
+        reply_markup=kb.skip_kb(cid)
+    )
 
 
 @router.callback_query(F.data.startswith("nobtn:"))
 async def cb_nobtn(c: CallbackQuery, state: FSMContext):
     chat_id = int(c.data.split(":")[1])
     await state.update_data(btn_text=None, btn_url=None)
-    await state.set_state(Form.post_time)
+    await state.set_state(Form.post_repeat)
     await c.message.edit_text(
-        f"🕓 Шаг 3/3. Дата и время: ДД.ММ.ГГГГ ЧЧ:ММ\n"
-        f"Например: {datetime.now(TZ).strftime('%d.%m.%Y')} 20:00 (UTC+{TIMEZONE_OFFSET})",
-        reply_markup=kb.back_kb(f"posts:{chat_id}")
+        "🔁 Шаг 3/4. Как часто публиковать?",
+        reply_markup=kb.repeat_kb(chat_id)
     )
     await c.answer()
 
@@ -2221,20 +2317,34 @@ async def cb_nobtn(c: CallbackQuery, state: FSMContext):
 async def in_post_button(message: Message, state: FSMContext):
     if not is_admin_id(message.from_user.id):
         return
-    if "|" not in message.text:
+    if "|" not in (message.text or ""):
         await message.answer("Формат: Название | https://ссылка")
         return
     bt, bu = [p.strip() for p in message.text.split("|", 1)]
     if not (bu.startswith("http://") or bu.startswith("https://")):
         await message.answer("Ссылка должна начинаться с http:// или https://")
         return
+    data = await state.get_data()
     await state.update_data(btn_text=bt, btn_url=bu)
-    await state.set_state(Form.post_time)
+    await state.set_state(Form.post_repeat)
     await message.answer(
-        f"🕓 Шаг 3/3. Дата и время: ДД.ММ.ГГГГ ЧЧ:ММ\n"
-        f"Например: {datetime.now(TZ).strftime('%d.%m.%Y')} 20:00 (UTC+{TIMEZONE_OFFSET})"
+        "🔁 Шаг 3/4. Как часто публиковать?",
+        reply_markup=kb.repeat_kb(data["chat_id"])
     )
 
+@router.callback_query(F.data.startswith("setrepeat:"), Form.post_repeat)
+async def cb_set_repeat(c: CallbackQuery, state: FSMContext):
+    _, chat_id, mode = c.data.split(":")
+    await state.update_data(repeat_mode=mode)
+    await state.set_state(Form.post_time)
+    label = {"once": "разово", "daily": "каждый день", "weekly": "каждую неделю"}.get(mode, "разово")
+    await c.message.edit_text(
+        f"🕓 Шаг 4/4. Повтор: {label}.\n"
+        f"Дата и время первой публикации: ДД.ММ.ГГГГ ЧЧ:ММ\n"
+        f"Например: {datetime.now(TZ).strftime('%d.%m.%Y')} 20:00 (UTC+{TIMEZONE_OFFSET})",
+        reply_markup=kb.back_kb(f"posts:{chat_id}")
+    )
+    await c.answer()
 
 @router.message(Form.post_time)
 async def in_post_time(message: Message, state: FSMContext):
@@ -2253,10 +2363,13 @@ async def in_post_time(message: Message, state: FSMContext):
     cid = data["chat_id"]
     await db.add_post(
         cid,
-        data["post_text"],
+        data.get("post_text") or "",
         data.get("btn_text"),
         data.get("btn_url"),
         pub,
+        media_type=data.get("media_type"),
+        media_id=data.get("media_id"),
+        repeat_mode=data.get("repeat_mode", "once"),
     )
     await state.clear()
     prefix = "✅ Запланировано на "
@@ -2272,9 +2385,135 @@ async def in_post_time(message: Message, state: FSMContext):
                              reply_markup=await kb.posts_menu_kb(cid))
 
 
+def _format_post_card(post):
+    """Собирает текстовое описание поста для карточки.
+    post = (id, chat_id, text, btn_text, btn_url, publish_at, media_type, media_id, repeat_mode)"""
+    _id, _cid, text, btn_text, btn_url, publish_at, media_type, media_id, repeat_mode = post
+    media_names = {"photo": "🖼 Фото", "video": "🎬 Видео",
+                   "document": "📎 Документ", "album": "🗂 Альбом"}
+    repeat_names = {"once": "разово", "daily": "каждый день", "weekly": "каждую неделю"}
+    when = datetime.fromtimestamp(publish_at, TZ).strftime("%d.%m.%Y %H:%M")
+    lines = ["📝 <b>Отложенный пост</b>\n"]
+    lines.append(f"🕓 Публикация: <b>{when}</b> (UTC+{TIMEZONE_OFFSET})")
+    lines.append(f"🔁 Повтор: {repeat_names.get(repeat_mode, 'разово')}")
+    lines.append(f"📦 Тип: {media_names.get(media_type, '📝 Текст')}")
+    if btn_text and btn_url:
+        lines.append(f"🔘 Кнопка: {btn_text} → {btn_url}")
+    body = text or "<i>(без текста)</i>"
+    if len(body) > 500:
+        body = body[:500] + "…"
+    lines.append(f"\n<b>Текст:</b>\n{body}")
+    return "\n".join(lines)
+
+
+@router.callback_query(F.data.startswith("postcard:"))
+async def cb_postcard(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    _, cid, pid = c.data.split(":")
+    post = await db.get_post(int(pid))
+    if not post or post[1] != int(cid):
+        await c.answer("Пост не найден (возможно, уже опубликован или удалён).", show_alert=True)
+        await c.message.edit_reply_markup(reply_markup=await kb.posts_menu_kb(int(cid)))
+        return
+    await c.message.edit_text(
+        _format_post_card(post),
+        reply_markup=kb.post_card_kb(int(cid), int(pid)),
+        disable_web_page_preview=True,
+    )
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("editposttext:"))
+async def cb_edit_post_text(c: CallbackQuery, state: FSMContext):
+    _, cid, pid = c.data.split(":")
+    await state.update_data(edit_chat_id=int(cid), edit_post_id=int(pid))
+    await state.set_state(Form.edit_post_text)
+    await c.message.edit_text(
+        "✏️ Пришли новый текст поста.\n"
+        "(Для постов с медиа это будет подпись.)",
+        reply_markup=kb.back_kb(f"postcard:{cid}:{pid}")
+    )
+    await c.answer()
+
+
+@router.message(Form.edit_post_text)
+async def in_edit_post_text(message: Message, state: FSMContext):
+    if not is_admin_id(message.from_user.id):
+        return
+    data = await state.get_data()
+    pid = data["edit_post_id"]
+    cid = data["edit_chat_id"]
+    await db.update_post_text(pid, message.html_text)
+    await state.clear()
+    post = await db.get_post(pid)
+    if post:
+        await message.answer(
+            _format_post_card(post),
+            reply_markup=kb.post_card_kb(cid, pid),
+            disable_web_page_preview=True,
+        )
+    else:
+        await message.answer("✅ Текст обновлён.", reply_markup=await kb.posts_menu_kb(cid))
+
+
+@router.callback_query(F.data.startswith("editposttime:"))
+async def cb_edit_post_time(c: CallbackQuery, state: FSMContext):
+    _, cid, pid = c.data.split(":")
+    await state.update_data(edit_chat_id=int(cid), edit_post_id=int(pid))
+    await state.set_state(Form.edit_post_time)
+    await c.message.edit_text(
+        f"🕓 Пришли новые дату и время: ДД.ММ.ГГГГ ЧЧ:ММ\n"
+        f"Например: {datetime.now(TZ).strftime('%d.%m.%Y')} 20:00 (UTC+{TIMEZONE_OFFSET})",
+        reply_markup=kb.back_kb(f"postcard:{cid}:{pid}")
+    )
+    await c.answer()
+
+
+@router.message(Form.edit_post_time)
+async def in_edit_post_time(message: Message, state: FSMContext):
+    if not is_admin_id(message.from_user.id):
+        return
+    try:
+        dt = datetime.strptime(message.text.strip(), "%d.%m.%Y %H:%M").replace(tzinfo=TZ)
+    except ValueError:
+        await message.answer("Формат: 25.12.2026 20:00")
+        return
+    pub = int(dt.timestamp())
+    if pub <= int(time.time()):
+        await message.answer("Это время уже прошло.")
+        return
+    data = await state.get_data()
+    pid = data["edit_post_id"]
+    cid = data["edit_chat_id"]
+    await db.update_post_time(pid, pub)
+    await state.clear()
+    post = await db.get_post(pid)
+    if post:
+        await message.answer(
+            _format_post_card(post),
+            reply_markup=kb.post_card_kb(cid, pid),
+            disable_web_page_preview=True,
+        )
+    else:
+        await message.answer("✅ Время обновлено.", reply_markup=await kb.posts_menu_kb(cid))
+
+
 @router.callback_query(F.data.startswith("delpost:"))
 async def cb_delpost(c: CallbackQuery):
     _, cid, pid = c.data.split(":")
+    await c.message.edit_text(
+        "🗑 Удалить этот отложенный пост?",
+        reply_markup=kb.post_delete_confirm_kb(int(cid), int(pid))
+    )
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("delpostok:"))
+async def cb_delpost_ok(c: CallbackQuery):
+    _, cid, pid = c.data.split(":")
     await db.cancel_post(int(pid), int(cid))
-    await c.message.edit_reply_markup(reply_markup=await kb.posts_menu_kb(int(cid)))
-    await c.answer("Отменено")
+    await c.message.edit_text(
+        "📝 <b>Отложенные посты</b>\nНажми на пост, чтобы открыть.",
+        reply_markup=await kb.posts_menu_kb(int(cid))
+    )
+    await c.answer("Удалено")

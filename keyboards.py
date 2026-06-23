@@ -136,13 +136,38 @@ async def posts_menu_kb(chat_id):
             text=f"🗑 {when} | {preview}".replace("\n", " "),
             callback_data=f"delpost:{chat_id}:{pid}"
         )])
-    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"ch:{chat_id}")])
+        rows.append([InlineKeyboardButton(
+            text=f"{ricon}{micon} {when} | {preview}".replace("\n", " "),
+            callback_data=f"postcard:{chat_id}:{pid}"
+        )])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
+def post_card_kb(chat_id, post_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Изменить текст", callback_data=f"editposttext:{chat_id}:{post_id}")],
+        [InlineKeyboardButton(text="🕓 Изменить время", callback_data=f"editposttime:{chat_id}:{post_id}")],
+        [InlineKeyboardButton(text="🗑 Удалить пост", callback_data=f"delpost:{chat_id}:{post_id}")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"posts:{chat_id}")],
+    ])
+
+
+def post_delete_confirm_kb(chat_id, post_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"delpostok:{chat_id}:{post_id}")],
+        [InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"postcard:{chat_id}:{post_id}")],
+    ])
 
 def skip_kb(chat_id):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⏭ Без кнопки", callback_data=f"nobtn:{chat_id}")],
+        [InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"posts:{chat_id}")],
+    ])
+
+def repeat_kb(chat_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="1️⃣ Разово", callback_data=f"setrepeat:{chat_id}:once")],
+        [InlineKeyboardButton(text="📅 Каждый день", callback_data=f"setrepeat:{chat_id}:daily")],
+        [InlineKeyboardButton(text="🗓 Каждую неделю", callback_data=f"setrepeat:{chat_id}:weekly")],
         [InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"posts:{chat_id}")],
     ])
 
