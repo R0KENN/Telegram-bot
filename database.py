@@ -79,7 +79,7 @@ async def init_db():
             )
         """)
 
-        # --- миграция: медиа и повтор в постах ---
+        # --- миграция: медиа, повтор, опубликованный id и опрос в постах ---
         async with db.execute("PRAGMA table_info(posts)") as cur:
             cols = [row[1] for row in await cur.fetchall()]
         if "media_type" not in cols:
@@ -90,6 +90,8 @@ async def init_db():
             await db.execute("ALTER TABLE posts ADD COLUMN repeat_mode TEXT DEFAULT 'once'")
         if "sent_message_id" not in cols:
             await db.execute("ALTER TABLE posts ADD COLUMN sent_message_id INTEGER")
+        if "poll_json" not in cols:
+            await db.execute("ALTER TABLE posts ADD COLUMN poll_json TEXT")
 
         await db.commit()
 
@@ -214,14 +216,15 @@ async def remove_members(chat_id, user_ids):
 
 # ====== ПОСТЫ ======
 async def add_post(chat_id, text, btn_text, btn_url, publish_at,
-                   media_type=None, media_id=None, repeat_mode="once"):
+                   media_type=None, media_id=None, repeat_mode="once",
+                   poll_json=None):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT INTO posts (chat_id, text, btn_text, btn_url, publish_at, status, "
-            "media_type, media_id, repeat_mode) "
-            "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
+            "media_type, media_id, repeat_mode, poll_json) "
+            "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
             (chat_id, text, btn_text, btn_url, publish_at,
-             media_type, media_id, repeat_mode),
+             media_type, media_id, repeat_mode, poll_json),
         )
         await db.commit()
 
@@ -239,8 +242,9 @@ async def get_due_posts():
     now = int(time.time())
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT id, chat_id, text, btn_text, btn_url, media_type, media_id, repeat_mode "
-            "FROM posts WHERE status='pending' AND publish_at<=?", (now,)
+            "SELECT id, chat_id, text, btn_text, btn_url, media_type, media_id, "
+            "repeat_mode, poll_json FROM posts "
+            "WHERE status='pending' AND publish_at<=?", (now,)
         ) as cur:
             return await cur.fetchall()
 
@@ -250,6 +254,12 @@ async def mark_post(post_id, status):
         await db.execute("UPDATE posts SET status=? WHERE id=?", (status, post_id))
         await db.commit()
 
+async def set_post_sent_id(post_id, message_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE posts SET sent_message_id=? WHERE id=?", (message_id, post_id)
+        )
+        await db.commit()
 
 async def cancel_post(post_id, chat_id):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -273,8 +283,8 @@ async def get_post(post_id):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             "SELECT id, chat_id, text, btn_text, btn_url, publish_at, "
-            "media_type, media_id, repeat_mode, sent_message_id FROM posts WHERE id=?",
-            (post_id,)
+            "media_type, media_id, repeat_mode, sent_message_id, poll_json "
+            "FROM posts WHERE id=?", (post_id,)
         ) as cur:
             return await cur.fetchone()
 
@@ -645,6 +655,38 @@ async def get_all_members(chat_id):
             "WHERE chat_id=? ORDER BY joined_at", (chat_id,)
         ) as cur:
             return await cur.fetchall()
+
+# ====== ГЛОБАЛЬНАЯ ПАНЕЛЬ СТАТУСА ======
+async def count_chats_by_type():
+    """Возвращает dict {'channel': N, 'group': M} по всем зарегистрированным чатам."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT type, COUNT(*) FROM chats WHERE chat_id != 0 GROUP BY type"
+        ) as cur:
+            rows = await cur.fetchall()
+    result = {"channel": 0, "group": 0}
+    for ctype, cnt in rows:
+        result[ctype] = cnt
+    return result
+
+
+async def count_pending_posts_all():
+    """Сколько всего постов в очереди по всем чатам."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM posts WHERE status='pending'"
+        ) as cur:
+            return (await cur.fetchone())[0]
+
+
+async def count_chats_with_log_thread():
+    """Сколько управляемых чатов имеют привязанную тему логов (log_thread_id задан)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM settings "
+            "WHERE key='log_thread_id' AND value != '' AND chat_id != 0"
+        ) as cur:
+            return (await cur.fetchone())[0]
 
 # ====== БЭКАП ======
 async def make_backup(dest_path):
