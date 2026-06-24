@@ -81,7 +81,7 @@ class Form(StatesGroup):
     flood_count = State()
     flood_window = State()
     flood_minutes = State()
-
+    reactall_range = State()
 
 def is_admin_id(uid):
     return uid == ADMIN_ID
@@ -539,6 +539,50 @@ async def _delayed_react(bot, chat_id, message_id):
     emoji = await db.get_setting(chat_id, "reaction_emoji") or "🔥"
     await _put_reaction(bot, chat_id, message_id, emoji)
 
+async def _reactall_range_worker(bot, chat_id, start_id, end_id, emoji, notify_to):
+    """Ставит реакции на посты в диапазоне id [start_id..end_id].
+    Если для поста уже есть подхваченная кастом-реакция в кэше — ставит её,
+    иначе обычный эмодзи из набора."""
+    done = 0       # успешно поставлено
+    skipped = 0    # уже были отреагированы
+    custom = 0     # из них кастом-эмодзи
+    try:
+        for mid in range(start_id, end_id + 1):
+            if await db.is_reacted(chat_id, mid):
+                skipped += 1
+                continue
+            # пробуем подхватить кастомку, если она была пойманной на свежем посте
+            custom_id = _custom_reactions.get((chat_id, mid))
+            ok = False
+            if custom_id:
+                try:
+                    from aiogram.types import ReactionTypeCustomEmoji
+                    await bot.set_message_reaction(
+                        chat_id=chat_id, message_id=mid,
+                        reaction=[ReactionTypeCustomEmoji(custom_emoji_id=custom_id)],
+                    )
+                    await db.mark_reacted(chat_id, mid)
+                    ok = True
+                    custom += 1
+                except Exception:
+                    ok = False  # кастомка недоступна — поставим обычную ниже
+            if not ok:
+                ok = await _put_reaction(bot, chat_id, mid, emoji)
+            if ok:
+                done += 1
+            await asyncio.sleep(0.4)  # бережём лимиты Telegram
+        try:
+            await bot.send_message(
+                notify_to,
+                f"✅ Готово. Поставлено реакций: {done} "
+                f"(из них кастом: {custom}), уже были: {skipped}, "
+                f"диапазон: {start_id}–{end_id}."
+            )
+        except Exception:
+            pass
+    finally:
+        _reactall_running.discard(chat_id)
+
 async def _reactall_worker(bot, chat_id, top_message_id, depth, emoji, notify_to):
     """Фоновый перебор: ставит реакции на последние `depth` постов вниз от top_message_id."""
     done = 0          # успешно поставлено реакций
@@ -617,46 +661,42 @@ async def cmd_reactall(message: Message):
     if not is_admin_id(message.from_user.id):
         return
     parts = message.text.split()
-    if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
+    # Формат: /reactall <chat_id> <from> <to>
+    if len(parts) != 4 or not parts[1].lstrip("-").isdigit() \
+            or not parts[2].isdigit() or not parts[3].isdigit():
         await message.answer(
-            "Использование: <code>/reactall &lt;chat_id&gt; [глубина]</code>\n"
-            "Пример: <code>/reactall -1001234567890 500</code>\n\n"
-            "chat_id канала можно увидеть в /menu (или это id из списка чатов).\n"
-            "Глубина по умолчанию 500, максимум 2000."
+            "Использование: <code>/reactall &lt;chat_id&gt; &lt;from&gt; &lt;to&gt;</code>\n"
+            "Пример: <code>/reactall -1001234567890 100 250</code>\n\n"
+            "За раз — не больше 500 постов. Удобнее пользоваться кнопкой "
+            "«Реакции на старые посты» в меню канала."
         )
         return
-
     chat_id = int(parts[1])
-    depth = 500
-    if len(parts) >= 3 and parts[2].isdigit():
-        depth = max(1, min(int(parts[2]), 2000))  # ограничиваем 1..2000
-
-    # Бот должен знать "верхний" message_id канала. Берём последний, на который реагировали,
-    # либо просим переслать свежий пост, если истории ещё нет.
-    top = await db.last_reacted_id(chat_id)
-    if not top:
-        await message.answer(
-            "Не знаю последний пост этого канала. Сначала опубликуй любой новый пост "
-            "(бот его отметит), потом запусти /reactall ещё раз."
-        )
+    start_id, end_id = int(parts[2]), int(parts[3])
+    if start_id > end_id:
+        start_id, end_id = end_id, start_id
+    if start_id < 1:
+        start_id = 1
+    count = end_id - start_id + 1
+    if count > 500:
+        await message.answer(f"Диапазон слишком большой ({count}). Максимум 500.")
         return
-
     if chat_id in _reactall_running:
         await message.answer("⚠️ По этому каналу перебор уже идёт. Дождись отчёта.")
         return
-
     emoji = await db.get_setting(chat_id, "reaction_emoji") or "🔥"
-    _reactall_running.add(chat_id)  # ставим флаг до запуска задачи
+    _reactall_running.add(chat_id)
     await message.answer(
-        f"⏳ Запускаю перебор {depth} постов вниз от id {top}. "
-        f"Это займёт примерно {int(depth * 0.4)} сек. Пришлю отчёт по завершении."
+        f"⏳ Запускаю перебор постов id {start_id}–{end_id} ({count} шт.). "
+        f"Это займёт примерно {int(count * 0.4)} сек."
     )
     asyncio.create_task(
-        _reactall_worker(message.bot, chat_id, top, depth, emoji, message.from_user.id)
+        _reactall_range_worker(message.bot, chat_id, start_id, end_id,
+                               emoji, message.from_user.id)
     )
 
 @router.callback_query(F.data.startswith("reactall:"))
-async def cb_reactall(c: CallbackQuery):
+async def cb_reactall(c: CallbackQuery, state: FSMContext):
     if not is_admin_id(c.from_user.id):
         await c.answer()
         return
@@ -664,24 +704,70 @@ async def cb_reactall(c: CallbackQuery):
     if chat_id in _reactall_running:
         await c.answer("По этому каналу перебор уже идёт.", show_alert=True)
         return
-    top = await db.last_reacted_id(chat_id)
-    if not top:
-        await c.answer(
-            "Сначала опубликуй любой новый пост, потом запусти снова.",
-            show_alert=True
+    await state.update_data(reactall_chat_id=chat_id)
+    await state.set_state(Form.reactall_range)
+
+    last_id = await db.last_reacted_id(chat_id)
+    hint = (f"\n📌 Последний отмеченный пост: <b>{last_id}</b> "
+            f"(можно отталкиваться от него).\n" if last_id else "")
+
+    await c.message.edit_text(
+        "🔁 <b>Реакции на старые посты</b>\n\n"
+        "Пришлите диапазон id постов через пробел:\n"
+        "<code>from to</code>\n"
+        "Например: <code>100 250</code>\n"
+        f"{hint}\n"
+        "id поста виден в его ссылке: <code>t.me/канал/123</code> → id = 123.\n"
+        "За раз — не больше 500 постов.\n\n"
+        "<i>На старые посты ставятся только обычные эмодзи из набора. "
+        "Кастом-эмодзи (премиум) здесь не подхватываются — это ограничение "
+        "Telegram: бот не может узнать реакции старого поста. Подхват кастома "
+        "работает только на новых постах в реальном времени.</i>",
+        reply_markup=kb.back_kb(f"reactions:{chat_id}")
+    )
+    await c.answer()
+
+@router.message(Form.reactall_range)
+async def in_reactall_range(message: Message, state: FSMContext):
+    if not is_admin_id(message.from_user.id):
+        return
+    data = await state.get_data()
+    chat_id = data.get("reactall_chat_id")
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not all(p.isdigit() for p in parts):
+        await message.answer(
+            "Нужно два числа через пробел, например: <code>100 250</code>"
         )
         return
-    depth = 500
+    start_id, end_id = int(parts[0]), int(parts[1])
+    if start_id > end_id:
+        start_id, end_id = end_id, start_id  # переставим, если перепутали местами
+    if start_id < 1:
+        start_id = 1
+    count = end_id - start_id + 1
+    if count > 500:
+        await message.answer(
+            f"Диапазон слишком большой ({count} постов). За раз — не больше 500. "
+            f"Сократи диапазон."
+        )
+        return
+
+    if chat_id in _reactall_running:
+        await message.answer("⚠️ По этому каналу перебор уже идёт. Дождись отчёта.")
+        return
+
+    await state.clear()
     emoji = await db.get_setting(chat_id, "reaction_emoji") or "🔥"
     _reactall_running.add(chat_id)
-    await c.message.answer(
-        f"⏳ Запускаю перебор {depth} постов вниз от id {top}. "
-        f"Это займёт примерно {int(depth * 0.4)} сек. Пришлю отчёт по завершении."
+    await message.answer(
+        f"⏳ Запускаю перебор постов id {start_id}–{end_id} ({count} шт.). "
+        f"Это займёт примерно {int(count * 0.4)} сек. Пришлю отчёт по завершении.",
+        reply_markup=await kb.reactions_menu_kb(chat_id)
     )
     asyncio.create_task(
-        _reactall_worker(c.bot, chat_id, top, depth, emoji, c.from_user.id)
+        _reactall_range_worker(message.bot, chat_id, start_id, end_id,
+                               emoji, message.from_user.id)
     )
-    await c.answer("Запущено")
 
 @router.callback_query(F.data.startswith("clearall:"))
 async def cb_clearall(c: CallbackQuery):
@@ -2564,6 +2650,10 @@ def _poll_options(options):
     except Exception:
         return list(options)
 
+async def _is_channel(chat_id):
+    chat = await db.get_chat(chat_id)
+    return bool(chat and chat[2] == "channel")
+
 def _extract_media_item(message: Message):
     """Достаёт из сообщения тип медиа и file_id. Возвращает dict или None."""
     if message.photo:
@@ -2674,7 +2764,10 @@ async def in_post_poll(message: Message, state: FSMContext):
     if any(len(o) > 100 for o in options):
         await message.answer("Каждый вариант — максимум 100 символов.")
         return
-    # Сохраняем опрос с настройками по умолчанию: анонимный, одиночный выбор
+    cid = (await state.get_data())["chat_id"]
+    is_channel = await _is_channel(cid)
+    # Сохраняем опрос с настройками по умолчанию: анонимный, одиночный выбор.
+    # Для каналов анонимность принудительная (публичные опросы там запрещены).
     poll_data = {
         "question": question,
         "options": options,
@@ -2682,11 +2775,14 @@ async def in_post_poll(message: Message, state: FSMContext):
         "allows_multiple_answers": False,
     }
     await state.update_data(poll_json=json.dumps(poll_data, ensure_ascii=False))
-    cid = (await state.get_data())["chat_id"]
+    note = ("\n\nℹ️ В каналах опрос всегда анонимный (ограничение Telegram)."
+            if is_channel else "")
     await message.answer(
-        f"✅ Опрос принят: «{question}» ({len(options)} вар.)\n\n"
+        f"✅ Опрос принят: «{question}» ({len(options)} вар.){note}\n\n"
         "⚙️ Настрой опрос или нажми «Готово»:",
-        reply_markup=kb.poll_options_kb(cid, is_anonymous=True, multiple=False)
+        reply_markup=kb.poll_options_kb(
+            cid, is_anonymous=True, multiple=False, is_channel=is_channel
+        )
     )
 
 @router.callback_query(F.data.startswith("polltgl:"))
@@ -2699,7 +2795,11 @@ async def cb_poll_toggle(c: CallbackQuery, state: FSMContext):
         await c.answer("Опрос не найден, начни заново.", show_alert=True)
         return
     poll = json.loads(raw)
+    is_channel = await _is_channel(chat_id)
     if what == "anon":
+        if is_channel:
+            await c.answer("В каналах опрос может быть только анонимным.", show_alert=True)
+            return
         poll["is_anonymous"] = not poll.get("is_anonymous", True)
     elif what == "multi":
         poll["allows_multiple_answers"] = not poll.get("allows_multiple_answers", False)
@@ -2709,6 +2809,7 @@ async def cb_poll_toggle(c: CallbackQuery, state: FSMContext):
             chat_id,
             is_anonymous=poll.get("is_anonymous", True),
             multiple=poll.get("allows_multiple_answers", False),
+            is_channel=is_channel,
         )
     )
     await c.answer()
@@ -2848,11 +2949,14 @@ async def _send_post(bot, chat_id, text, btn_text, btn_url, media_type, media_id
     if poll_json:
         try:
             poll = json.loads(poll_json)
+            anon = poll.get("is_anonymous", True)
+            if await _is_channel(chat_id):
+                anon = True  # в каналах только анонимный
             await bot.send_poll(
                 chat_id,
                 question=poll["question"],
                 options=_poll_options(poll["options"]),
-                is_anonymous=poll.get("is_anonymous", True),
+                is_anonymous=anon,
                 allows_multiple_answers=poll.get("allows_multiple_answers", False),
             )
         except Exception as e:

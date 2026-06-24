@@ -128,11 +128,15 @@ async def scheduler(bot: Bot):
                     if poll_json:
                         try:
                             poll = json.loads(poll_json)
+                            anon = poll.get("is_anonymous", True)
+                            _chat = await db.get_chat(chat_id)
+                            if _chat and _chat[2] == "channel":
+                                anon = True  # в каналах только анонимный
                             poll_msg = await bot.send_poll(
                                 chat_id,
                                 question=poll["question"],
                                 options=_poll_options(poll["options"]),
-                                is_anonymous=poll.get("is_anonymous", True),
+                                is_anonymous=anon,
                                 allows_multiple_answers=poll.get("allows_multiple_answers", False),
                             )
                             if sent_id is None:

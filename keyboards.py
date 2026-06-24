@@ -213,15 +213,17 @@ def poll_skip_kb(chat_id):
         [InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"posts:{chat_id}")],
     ])
 
-def poll_options_kb(chat_id, is_anonymous=True, multiple=False):
-    anon_label = "👁 Анонимный: ВКЛ" if is_anonymous else "👁 Анонимный: ВЫКЛ"
+def poll_options_kb(chat_id, is_anonymous=True, multiple=False, is_channel=True):
     multi_label = "☑️ Несколько ответов: ВКЛ" if multiple else "☑️ Несколько ответов: ВЫКЛ"
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=anon_label, callback_data=f"polltgl:anon:{chat_id}")],
-        [InlineKeyboardButton(text=multi_label, callback_data=f"polltgl:multi:{chat_id}")],
-        [InlineKeyboardButton(text="✅ Готово", callback_data=f"polldone:{chat_id}")],
-        [InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"posts:{chat_id}")],
-    ])
+    rows = []
+    if not is_channel:
+        # В каналах публичные опросы запрещены Telegram — переключатель скрыт.
+        anon_label = "👁 Анонимный: ВКЛ" if is_anonymous else "👁 Анонимный: ВЫКЛ"
+        rows.append([InlineKeyboardButton(text=anon_label, callback_data=f"polltgl:anon:{chat_id}")])
+    rows.append([InlineKeyboardButton(text=multi_label, callback_data=f"polltgl:multi:{chat_id}")])
+    rows.append([InlineKeyboardButton(text="✅ Готово", callback_data=f"polldone:{chat_id}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"posts:{chat_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def repeat_kb(chat_id):
     return InlineKeyboardMarkup(inline_keyboard=[
