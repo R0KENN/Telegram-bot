@@ -88,6 +88,8 @@ async def init_db():
             await db.execute("ALTER TABLE posts ADD COLUMN media_id TEXT")
         if "repeat_mode" not in cols:
             await db.execute("ALTER TABLE posts ADD COLUMN repeat_mode TEXT DEFAULT 'once'")
+        if "sent_message_id" not in cols:
+            await db.execute("ALTER TABLE posts ADD COLUMN sent_message_id INTEGER")
 
         await db.commit()
 
@@ -227,7 +229,7 @@ async def add_post(chat_id, text, btn_text, btn_url, publish_at,
 async def get_pending_posts(chat_id):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT id, text, publish_at FROM posts "
+            "SELECT id, text, publish_at, media_type, repeat_mode FROM posts "
             "WHERE chat_id=? AND status='pending' ORDER BY publish_at", (chat_id,)
         ) as cur:
             return await cur.fetchall()
@@ -271,7 +273,8 @@ async def get_post(post_id):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             "SELECT id, chat_id, text, btn_text, btn_url, publish_at, "
-            "media_type, media_id, repeat_mode FROM posts WHERE id=?", (post_id,)
+            "media_type, media_id, repeat_mode, sent_message_id FROM posts WHERE id=?",
+            (post_id,)
         ) as cur:
             return await cur.fetchone()
 
@@ -286,6 +289,87 @@ async def update_post_time(post_id, publish_at):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE posts SET publish_at=? WHERE id=?", (publish_at, post_id))
         await db.commit()
+
+async def update_post_repeat(post_id, repeat_mode):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE posts SET repeat_mode=? WHERE id=?", (repeat_mode, post_id))
+        await db.commit()
+
+
+async def update_post_button(post_id, btn_text, btn_url):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE posts SET btn_text=?, btn_url=? WHERE id=?",
+            (btn_text, btn_url, post_id)
+        )
+        await db.commit()
+
+async def set_sent_message_id(post_id, message_id):
+    """Сохраняет id опубликованного сообщения (для последующего редактирования)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE posts SET sent_message_id=? WHERE id=?", (message_id, post_id)
+        )
+        await db.commit()
+
+
+async def get_published_posts(chat_id, limit=20):
+    """Опубликованные посты, у которых сохранён message_id (можно редактировать)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id, text, publish_at, media_type, sent_message_id FROM posts "
+            "WHERE chat_id=? AND status='published' AND sent_message_id IS NOT NULL "
+            "ORDER BY publish_at DESC LIMIT ?",
+            (chat_id, limit)
+        ) as cur:
+            return await cur.fetchall()
+
+async def count_posts_by_status(chat_id):
+    """Возвращает dict {status: count} для постов чата."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT status, COUNT(*) FROM posts WHERE chat_id=? GROUP BY status",
+            (chat_id,)
+        ) as cur:
+            rows = await cur.fetchall()
+    return {status: cnt for status, cnt in rows}
+
+async def delete_old_posts(days=30):
+    """Удаляет завершённые посты (published/cancelled/failed) старше days дней.
+    Возвращает число удалённых записей. pending не трогаем."""
+    cutoff = int(time.time()) - days * 86400
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "DELETE FROM posts WHERE status IN ('published','cancelled','failed') "
+            "AND publish_at < ?",
+            (cutoff,)
+        )
+        await db.commit()
+        return cur.rowcount
+
+
+async def delete_finished_posts(chat_id):
+    """Удаляет ВСЕ завершённые посты конкретного чата (по кнопке). Возвращает число."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "DELETE FROM posts WHERE chat_id=? AND "
+            "status IN ('published','cancelled','failed')",
+            (chat_id,)
+        )
+        await db.commit()
+        return cur.rowcount
+
+
+async def get_finished_posts(chat_id, limit=20):
+    """История завершённых постов чата (для просмотра)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id, text, publish_at, status, media_type, repeat_mode FROM posts "
+            "WHERE chat_id=? AND status IN ('published','cancelled','failed') "
+            "ORDER BY publish_at DESC LIMIT ?",
+            (chat_id, limit)
+        ) as cur:
+            return await cur.fetchall()
 
 
 # ====== КНОПКИ ПРИВЕТСТВИЯ ======
@@ -561,3 +645,11 @@ async def get_all_members(chat_id):
             "WHERE chat_id=? ORDER BY joined_at", (chat_id,)
         ) as cur:
             return await cur.fetchall()
+
+# ====== БЭКАП ======
+async def make_backup(dest_path):
+    """Делает целостную копию БД в dest_path (безопасно при WAL)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        # VACUUM INTO создаёт консистентную копию, не мешая рабочей базе
+        await db.execute("VACUUM INTO ?", (dest_path,))
+        await db.commit()

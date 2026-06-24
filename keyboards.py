@@ -30,6 +30,7 @@ async def chat_menu_kb(chat_id):
             [InlineKeyboardButton(text="⚙️ Приветствие (в личку)", callback_data=f"wmenu:{chat_id}")],
             [InlineKeyboardButton(text="📨 Рассылка", callback_data=f"bc:{chat_id}")],
             [InlineKeyboardButton(text="📝 Посты", callback_data=f"posts:{chat_id}")],
+            [InlineKeyboardButton(text="📮 Статистика постов", callback_data=f"poststats:{chat_id}")],
             [InlineKeyboardButton(text="🔥 Реакции", callback_data=f"reactions:{chat_id}")],
         ]
     else:  # группа
@@ -127,29 +128,68 @@ async def group_welcome_kb(chat_id):
 
 
 # --- посты ---
+# --- посты ---
 async def posts_menu_kb(chat_id):
     rows = [[InlineKeyboardButton(text="➕ Новый отложенный пост", callback_data=f"newpost:{chat_id}")]]
-    for pid, text, publish_at in await db.get_pending_posts(chat_id):
+    media_icons = {"photo": "🖼", "video": "🎬", "document": "📎", "album": "🗂"}
+    repeat_icons = {"daily": "📅", "weekly": "🗓"}
+    for pid, text, publish_at, media_type, repeat_mode in await db.get_pending_posts(chat_id):
         when = datetime.fromtimestamp(publish_at, TZ).strftime("%d.%m %H:%M")
-        preview = (text[:20] + "…") if len(text) > 20 else text
-        rows.append([InlineKeyboardButton(
-            text=f"🗑 {when} | {preview}".replace("\n", " "),
-            callback_data=f"delpost:{chat_id}:{pid}"
-        )])
+        base = text or ""
+        preview = (base[:18] + "…") if len(base) > 18 else (base or "медиа")
+        micon = media_icons.get(media_type, "📝")
+        ricon = repeat_icons.get(repeat_mode, "")
         rows.append([InlineKeyboardButton(
             text=f"{ricon}{micon} {when} | {preview}".replace("\n", " "),
             callback_data=f"postcard:{chat_id}:{pid}"
         )])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"ch:{chat_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def post_card_kb(chat_id, post_id):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✏️ Изменить текст", callback_data=f"editposttext:{chat_id}:{post_id}")],
         [InlineKeyboardButton(text="🕓 Изменить время", callback_data=f"editposttime:{chat_id}:{post_id}")],
+        [InlineKeyboardButton(text="🔁 Изменить повтор", callback_data=f"editpostrep:{chat_id}:{post_id}")],
+        [InlineKeyboardButton(text="🔘 Изменить кнопку", callback_data=f"editpostbtn:{chat_id}:{post_id}")],
         [InlineKeyboardButton(text="🗑 Удалить пост", callback_data=f"delpost:{chat_id}:{post_id}")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"posts:{chat_id}")],
     ])
 
+
+def post_repeat_edit_kb(chat_id, post_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="1️⃣ Разово", callback_data=f"setpostrep:{chat_id}:{post_id}:once")],
+        [InlineKeyboardButton(text="📅 Каждый день", callback_data=f"setpostrep:{chat_id}:{post_id}:daily")],
+        [InlineKeyboardButton(text="🗓 Каждую неделю", callback_data=f"setpostrep:{chat_id}:{post_id}:weekly")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"postcard:{chat_id}:{post_id}")],
+    ])
+
+async def editpub_list_kb(chat_id):
+    rows = []
+    media_icons = {"photo": "🖼", "video": "🎬", "document": "📎", "album": "🗂"}
+    for pid, text, publish_at, media_type, sent_id in await db.get_published_posts(chat_id):
+        when = datetime.fromtimestamp(publish_at, TZ).strftime("%d.%m %H:%M")
+        base = text or ""
+        preview = (base[:16] + "…") if len(base) > 16 else (base or "медиа")
+        micon = media_icons.get(media_type, "📝")
+        rows.append([InlineKeyboardButton(
+            text=f"{micon} {when} | {preview}".replace("\n", " "),
+            callback_data=f"editpubcard:{chat_id}:{pid}"
+        )])
+    if not rows:
+        rows.append([InlineKeyboardButton(
+            text="Нет опубликованных постов", callback_data=f"poststats:{chat_id}"
+        )])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"poststats:{chat_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def editpub_card_kb(chat_id, post_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Изменить текст/подпись", callback_data=f"editpubtext:{chat_id}:{post_id}")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"editpub:{chat_id}")],
+    ])
 
 def post_delete_confirm_kb(chat_id, post_id):
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -170,6 +210,40 @@ def repeat_kb(chat_id):
         [InlineKeyboardButton(text="🗓 Каждую неделю", callback_data=f"setrepeat:{chat_id}:weekly")],
         [InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"posts:{chat_id}")],
     ])
+
+def post_confirm_kb(chat_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Запланировать", callback_data=f"postsave:{chat_id}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"postcancel:{chat_id}")],
+    ])
+
+def poststats_kb(chat_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📜 История постов", callback_data=f"posthist:{chat_id}")],
+        [InlineKeyboardButton(text="✏️ Редактировать опубликованные", callback_data=f"editpub:{chat_id}")],
+        [InlineKeyboardButton(text="🧹 Очистить завершённые", callback_data=f"postclean:{chat_id}")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"ch:{chat_id}")],
+    ])
+
+
+async def post_history_kb(chat_id):
+    rows = []
+    status_icons = {"published": "✅", "cancelled": "🚫", "failed": "❌"}
+    media_icons = {"photo": "🖼", "video": "🎬", "document": "📎", "album": "🗂"}
+    for pid, text, publish_at, status, media_type, repeat_mode in await db.get_finished_posts(chat_id):
+        when = datetime.fromtimestamp(publish_at, TZ).strftime("%d.%m %H:%M")
+        base = text or ""
+        preview = (base[:16] + "…") if len(base) > 16 else (base or "медиа")
+        sicon = status_icons.get(status, "•")
+        micon = media_icons.get(media_type, "📝")
+        rows.append([InlineKeyboardButton(
+            text=f"{sicon}{micon} {when} | {preview}".replace("\n", " "),
+            callback_data=f"histcard:{chat_id}:{pid}"
+        )])
+    if not rows:
+        rows.append([InlineKeyboardButton(text="История пуста", callback_data=f"poststats:{chat_id}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"poststats:{chat_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 # --- привязка темы лог-группы к чату ---
 async def log_topic_kb(chat_id):

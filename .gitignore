@@ -5,3 +5,5 @@ __pycache__/
 venv/
 .venv/
 bot.log
+fsm.db
+backup_*.db
