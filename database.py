@@ -79,7 +79,7 @@ async def init_db():
             )
         """)
 
-        # --- миграция: медиа, повтор, опубликованный id и опрос в постах ---
+        # --- миграция: медиа, повтор, id опубликованного и опрос в постах ---
         async with db.execute("PRAGMA table_info(posts)") as cur:
             cols = [row[1] for row in await cur.fetchall()]
         if "media_type" not in cols:
@@ -243,8 +243,8 @@ async def get_due_posts():
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             "SELECT id, chat_id, text, btn_text, btn_url, media_type, media_id, "
-            "repeat_mode, poll_json FROM posts "
-            "WHERE status='pending' AND publish_at<=?", (now,)
+            "repeat_mode, poll_json "
+            "FROM posts WHERE status='pending' AND publish_at<=?", (now,)
         ) as cur:
             return await cur.fetchall()
 
@@ -311,14 +311,6 @@ async def update_post_button(post_id, btn_text, btn_url):
         await db.execute(
             "UPDATE posts SET btn_text=?, btn_url=? WHERE id=?",
             (btn_text, btn_url, post_id)
-        )
-        await db.commit()
-
-async def set_sent_message_id(post_id, message_id):
-    """Сохраняет id опубликованного сообщения (для последующего редактирования)."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE posts SET sent_message_id=? WHERE id=?", (message_id, post_id)
         )
         await db.commit()
 
@@ -647,18 +639,9 @@ async def get_join_timestamps(chat_id, since=None):
             return [r[0] for r in await cur.fetchall()]
 
 
-async def get_all_members(chat_id):
-    """Полный список участников чата для выгрузки в CSV."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT user_id, full_name, username, joined_at FROM members "
-            "WHERE chat_id=? ORDER BY joined_at", (chat_id,)
-        ) as cur:
-            return await cur.fetchall()
-
 # ====== ГЛОБАЛЬНАЯ ПАНЕЛЬ СТАТУСА ======
 async def count_chats_by_type():
-    """Возвращает dict {'channel': N, 'group': M} по всем зарегистрированным чатам."""
+    """Возвращает dict {'channel': N, 'group': M} по всем реальным чатам."""
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             "SELECT type, COUNT(*) FROM chats WHERE chat_id != 0 GROUP BY type"
@@ -680,13 +663,14 @@ async def count_pending_posts_all():
 
 
 async def count_chats_with_log_thread():
-    """Сколько управляемых чатов имеют привязанную тему логов (log_thread_id задан)."""
+    """Сколько управляемых чатов имеют привязанную тему логов."""
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             "SELECT COUNT(*) FROM settings "
             "WHERE key='log_thread_id' AND value != '' AND chat_id != 0"
         ) as cur:
             return (await cur.fetchone())[0]
+
 
 # ====== БЭКАП ======
 async def make_backup(dest_path):

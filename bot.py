@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from logging.handlers import RotatingFileHandler
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -12,12 +13,17 @@ from handlers import router
 from scheduler import scheduler, backup_task
 from commands import setup_commands
 
+# Файл-лог с ротацией: до 5 МБ на файл, храним 3 архива (bot.log.1 … bot.log.3)
+_file_handler = RotatingFileHandler(
+    "bot.log", maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
     handlers=[
-        logging.StreamHandler(),                       # вывод в консоль
-        logging.FileHandler("bot.log", encoding="utf-8"),  # дублирование в файл
+        logging.StreamHandler(),  # вывод в консоль
+        _file_handler,            # файл с ротацией
     ],
 )
 # Понижаем «болтливость» библиотек, чтобы лог не был засорён

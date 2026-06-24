@@ -9,8 +9,11 @@ from config import TZ
 async def chats_kb():
     rows = []
     for chat_id, title, ctype in await db.get_chats():
+        if chat_id == 0:
+            continue  # служебная запись лог-группы — не показываем в списке
         icon = "📢" if ctype == "channel" else "👥"
         rows.append([InlineKeyboardButton(text=f"{icon} {title}", callback_data=f"ch:{chat_id}")])
+    rows.append([InlineKeyboardButton(text="📋 Статус (сводка)", callback_data="globalstatus")])
     rows.append([InlineKeyboardButton(text="➕ Добавить канал/группу", callback_data="addch")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -43,6 +46,7 @@ async def chat_menu_kb(chat_id):
         [InlineKeyboardButton(text="📈 График прироста", callback_data=f"chart:{chat_id}"),
          InlineKeyboardButton(text="📄 Экспорт CSV", callback_data=f"export:{chat_id}")],
         [InlineKeyboardButton(text="🧵 Тема для логов", callback_data=f"logtopic:{chat_id}")],
+        [InlineKeyboardButton(text="🔍 Проверить права", callback_data=f"rights:{chat_id}")],
         [InlineKeyboardButton(text="♻️ Сбросить настройки", callback_data=f"reset:{chat_id}")],
         [InlineKeyboardButton(text="🗑 Удалить из списка", callback_data=f"delchat:{chat_id}")],
         [InlineKeyboardButton(text="⬅️ К списку", callback_data="chats")],
@@ -203,6 +207,22 @@ def skip_kb(chat_id):
         [InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"posts:{chat_id}")],
     ])
 
+def poll_skip_kb(chat_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⏭ Без опроса", callback_data=f"nopoll:{chat_id}")],
+        [InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"posts:{chat_id}")],
+    ])
+
+def poll_options_kb(chat_id, is_anonymous=True, multiple=False):
+    anon_label = "👁 Анонимный: ВКЛ" if is_anonymous else "👁 Анонимный: ВЫКЛ"
+    multi_label = "☑️ Несколько ответов: ВКЛ" if multiple else "☑️ Несколько ответов: ВЫКЛ"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=anon_label, callback_data=f"polltgl:anon:{chat_id}")],
+        [InlineKeyboardButton(text=multi_label, callback_data=f"polltgl:multi:{chat_id}")],
+        [InlineKeyboardButton(text="✅ Готово", callback_data=f"polldone:{chat_id}")],
+        [InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"posts:{chat_id}")],
+    ])
+
 def repeat_kb(chat_id):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="1️⃣ Разово", callback_data=f"setrepeat:{chat_id}:once")],
@@ -302,6 +322,11 @@ async def log_topic_choice_kb(chat_id, log_chat):
 def back_kb(target):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⬅️ Назад", callback_data=target)]
+    ])
+def global_status_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔍 Проверить права во всех чатах", callback_data="rightsall")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="chats")],
     ])
 # Популярные разрешённые эмодзи для выбора
 REACTION_CHOICES = ["👍", "❤", "🔥", "🎉", "👏", "😁", "🤩", "🙏", "👌", "🤝", "💯", "⚡"]

@@ -61,6 +61,7 @@ class Form(StatesGroup):
     post_text = State()
     post_media = State()
     post_button = State()
+    post_poll = State()
     post_repeat = State()
     post_time = State()
     post_confirm = State()
@@ -84,6 +85,95 @@ class Form(StatesGroup):
 
 def is_admin_id(uid):
     return uid == ADMIN_ID
+
+# ============================================================
+#            ПРОВЕРКА ПРАВ БОТА В ЧАТЕ + ДИАГНОСТИКА
+# ============================================================
+# Какие права нужны для каждой функции (атрибуты ChatMemberAdministrator).
+_FEATURE_RIGHTS = {
+    "Модерация (удаление, варны)": ["can_delete_messages", "can_restrict_members"],
+    "Капча для новичков":          ["can_restrict_members"],
+    "Антифлуд":                    ["can_restrict_members"],
+    "Темы логов / форум":          ["can_manage_topics"],
+    "Приём заявок":                ["can_invite_users"],
+    "Публикация постов":           ["can_post_messages"],
+}
+
+# Подмножества для краткой сводки при добавлении (по типу чата)
+_FEATURE_RIGHTS_CHANNEL = {
+    "Публикация постов": ["can_post_messages"],
+    "Приём заявок":      ["can_invite_users"],
+}
+_FEATURE_RIGHTS_GROUP = {
+    "Модерация":  ["can_delete_messages", "can_restrict_members"],
+    "Темы логов": ["can_manage_topics"],
+    "Приём заявок": ["can_invite_users"],
+}
+
+# Человекочитаемые названия прав для подсказок
+_RIGHT_LABELS = {
+    "can_delete_messages": "Удаление сообщений",
+    "can_restrict_members": "Блокировка участников",
+    "can_invite_users": "Добавление участников / приём заявок",
+    "can_manage_topics": "Управление темами",
+    "can_post_messages": "Публикация сообщений",
+    "can_pin_messages": "Закрепление",
+}
+
+
+async def collect_bot_rights(bot, chat_id):
+    """
+    Опрашивает get_chat_member(самого бота). Возвращает (status, rights_dict, error).
+    status — 'administrator'/'member'/… либо None при ошибке.
+    """
+    try:
+        me = await bot.get_me()
+        member = await bot.get_chat_member(chat_id, me.id)
+    except Exception as e:
+        return None, {}, str(e)
+
+    rights = {}
+    for attr in (
+        "can_delete_messages", "can_restrict_members", "can_invite_users",
+        "can_manage_topics", "can_post_messages", "can_pin_messages",
+        "can_promote_members", "can_change_info", "can_edit_messages",
+    ):
+        rights[attr] = bool(getattr(member, attr, False))
+    return member.status, rights, None
+
+
+def _format_rights_report(title, status, rights, error, chat_type):
+    """Собирает читаемый отчёт с галочками по каждой функции."""
+    if error:
+        return (f"🔍 <b>Проверка прав: {title}</b>\n\n"
+                f"❌ Не удалось получить данные: <code>{error}</code>\n\n"
+                f"Убедись, что бот всё ещё состоит в чате.")
+
+    lines = [f"🔍 <b>Проверка прав: {title}</b>\n"]
+    if status != "administrator":
+        lines.append("⚠️ Бот <b>не админ</b> — почти все функции работать не будут.\n")
+    else:
+        lines.append("✅ Бот является администратором.\n")
+
+    if chat_type == "channel":
+        irrelevant = {"Капча для новичков", "Антифлуд",
+                      "Модерация (удаление, варны)", "Темы логов / форум"}
+    else:
+        irrelevant = {"Публикация постов"}
+
+    for feature, needed in _FEATURE_RIGHTS.items():
+        if feature in irrelevant:
+            continue
+        ok = all(rights.get(r, False) for r in needed)
+        lines.append(f"{'✅' if ok else '❌'} {feature}")
+        if not ok:
+            missing = [r for r in needed if not rights.get(r, False)]
+            human = ", ".join(_RIGHT_LABELS.get(m, m) for m in missing)
+            lines.append(f"     └ не хватает: <i>{human}</i>")
+
+    lines.append("\nНедостающие права выдаются в настройках чата Telegram "
+                 "(управление администраторами → этот бот).")
+    return "\n".join(lines)
 
 async def safe_send(bot, chat_id, text, **kwargs):
     """
@@ -214,6 +304,82 @@ async def cb_chats(c: CallbackQuery, state: FSMContext):
     await c.message.edit_text("<b>Твои каналы и группы:</b>", reply_markup=await kb.chats_kb())
     await c.answer()
 
+@router.callback_query(F.data == "globalstatus")
+async def cb_global_status(c: CallbackQuery, state: FSMContext):
+    if not is_admin_id(c.from_user.id):
+        await c.answer()
+        return
+    await state.clear()
+    types = await db.count_chats_by_type()
+    channels = types.get("channel", 0)
+    groups = types.get("group", 0)
+    pending = await db.count_pending_posts_all()
+    with_topic = await db.count_chats_with_log_thread()
+    log_chat = await db.get_global_log_chat()
+    total = channels + groups
+    log_line = f"задана (<code>{log_chat}</code>)" if log_chat else "не задана"
+    await c.message.edit_text(
+        "📋 <b>Сводка по всем чатам</b>\n\n"
+        f"📢 Каналов: <b>{channels}</b>\n"
+        f"👥 Групп: <b>{groups}</b>\n"
+        f"📦 Всего чатов: <b>{total}</b>\n"
+        "━━━━━━━━━━━━\n"
+        f"⏳ Постов в очереди: <b>{pending}</b>\n"
+        f"🧵 Лог-группа: {log_line}\n"
+        f"🔗 Чатов с привязанной темой: <b>{with_topic}</b> из {total}",
+        reply_markup=kb.global_status_kb()
+    )
+    await c.answer()
+
+
+@router.callback_query(F.data == "rightsall")
+async def cb_rights_all(c: CallbackQuery):
+    if not is_admin_id(c.from_user.id):
+        await c.answer()
+        return
+    await c.answer("Проверяю все чаты…")
+    log_chat = await db.get_global_log_chat()
+    problems = []
+    checked = 0
+    for cid, title, ctype in await db.get_chats():
+        if cid == 0 or cid == log_chat:
+            continue
+        checked += 1
+        status, rights, error = await collect_bot_rights(c.bot, cid)
+        if error:
+            problems.append(f"⚠️ «{title}»: ошибка ({error})")
+            continue
+        if status != "administrator":
+            problems.append(f"❌ «{title}»: бот не админ")
+            continue
+        relevant = (_FEATURE_RIGHTS_CHANNEL if ctype == "channel"
+                    else _FEATURE_RIGHTS_GROUP)
+        missing = [feat for feat, needed in relevant.items()
+                   if not all(rights.get(r, False) for r in needed)]
+        if missing:
+            problems.append(f"⚠️ «{title}»: нет прав для — {', '.join(missing)}")
+        await asyncio.sleep(0.1)  # бережём лимиты
+
+    if not problems:
+        text = f"✅ Проверено чатов: {checked}. Везде всё в порядке."
+    else:
+        text = (f"🔍 Проверено чатов: {checked}. Найдены проблемы:\n\n"
+                + "\n".join(problems))
+    await c.message.edit_text(text, reply_markup=kb.back_kb("chats"))
+
+@router.callback_query(F.data.startswith("rights:"))
+async def cb_rights(c: CallbackQuery):
+    if not is_admin_id(c.from_user.id):
+        await c.answer()
+        return
+    chat_id = int(c.data.split(":")[1])
+    chat = await db.get_chat(chat_id)
+    title = chat[1] if chat else str(chat_id)
+    ctype = chat[2] if chat else "group"
+    await c.answer("Проверяю права…")
+    status, rights, error = await collect_bot_rights(c.bot, chat_id)
+    report = _format_rights_report(title, status, rights, error, ctype)
+    await c.message.edit_text(report, reply_markup=kb.back_kb(f"ch:{chat_id}"))
 
 @router.callback_query(F.data == "addch")
 async def cb_addch(c: CallbackQuery):
@@ -244,6 +410,7 @@ async def on_forward(message: Message):
 
 
 # Регистрация группы при добавлении бота
+# Регистрация группы при добавлении бота
 @router.my_chat_member()
 async def on_added_to_chat(event: ChatMemberUpdated):
     chat = event.chat
@@ -251,16 +418,32 @@ async def on_added_to_chat(event: ChatMemberUpdated):
     if new_status not in ("administrator", "member"):
         return
 
+    async def _rights_hint():
+        status, rights, error = await collect_bot_rights(event.bot, chat.id)
+        if error:
+            return f"\n\n⚠️ Не удалось проверить права: {error}"
+        if status != "administrator":
+            return ("\n\n⚠️ Бот добавлен <b>не админом</b> — модерация, капча, "
+                    "посты и приём заявок работать не будут. Выдай боту права админа.")
+        relevant = (_FEATURE_RIGHTS_CHANNEL if chat.type == "channel"
+                    else _FEATURE_RIGHTS_GROUP)
+        missing = [feat for feat, needed in relevant.items()
+                   if not all(rights.get(r, False) for r in needed)]
+        if not missing:
+            return "\n\n✅ Все нужные права на месте."
+        return ("\n\n⚠️ Не хватает прав для: " + ", ".join(missing) +
+                ".\nОткрой /menu → чат → «🔍 Проверить права» для деталей.")
+
     if chat.type == "channel":
         is_new = await db.register_chat(chat.id, chat.title or str(chat.id), "channel")
         if is_new:
             await ensure_log_topic(event.bot, chat.id, chat.title or str(chat.id))
-        if is_new:
+            hint = await _rights_hint()
             try:
                 await event.bot.send_message(
                     ADMIN_ID,
                     f"✅ Бот добавлен в канал «{chat.title}».\n"
-                    f"Открой /menu для настройки."
+                    f"Открой /menu для настройки.{hint}"
                 )
             except Exception:
                 pass
@@ -268,12 +451,12 @@ async def on_added_to_chat(event: ChatMemberUpdated):
         is_new = await db.register_chat(chat.id, chat.title or str(chat.id), "group")
         if is_new:
             await ensure_log_topic(event.bot, chat.id, chat.title or str(chat.id))
+            hint = await _rights_hint()
             try:
                 await event.bot.send_message(
                     ADMIN_ID,
                     f"✅ Бот добавлен в группу «{chat.title}».\n"
-                    f"Открой /menu для настройки. Дай боту права админа "
-                    f"(удаление сообщений) для модерации."
+                    f"Открой /menu для настройки.{hint}"
                 )
             except Exception:
                 pass
@@ -405,6 +588,29 @@ async def _clearall_worker(bot, chat_id, notify_to):
             pass
     finally:
         _reactall_running.discard(chat_id)
+
+@router.message(Command("backup"), F.chat.type == ChatType.PRIVATE)
+async def cmd_backup(message: Message):
+    if not is_admin_id(message.from_user.id):
+        return
+    import os
+    path = f"backup_{int(time.time())}.db"
+    try:
+        await db.make_backup(path)
+        with open(path, "rb") as f:
+            data = f.read()
+        await message.answer_document(
+            BufferedInputFile(data, filename="bot_backup.db"),
+            caption="💾 Резервная копия базы."
+        )
+    except Exception as e:
+        logger.error("Бэкап не удался: %s", e)
+        await message.answer(f"⚠️ Не удалось сделать бэкап: {e}")
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 @router.message(Command("reactall"), F.chat.type == ChatType.PRIVATE)
 async def cmd_reactall(message: Message):
@@ -1457,10 +1663,13 @@ async def cb_stats(c: CallbackQuery):
     today = await db.count_members(chat_id, since=now - 86400)
     last7 = await db.count_members(chat_id, since=now - 7 * 86400)
     status = "включён 🟢" if await db.is_auto_approve(chat_id) else "выключен 🔴"
+    chat = await db.get_chat(chat_id)
+    ctype = chat[2] if chat else "channel"
+    markup = kb.poststats_kb(chat_id) if ctype == "channel" else kb.back_kb(f"ch:{chat_id}")
     await c.message.edit_text(
         f"📊 <b>Статистика</b>\n\nВсего: <b>{total}</b>\nЗа сутки: <b>{today}</b>\n"
         f"За неделю: <b>{last7}</b>\nАвтоприём: {status}",
-        reply_markup=kb.poststats_kb(chat_id)
+        reply_markup=markup
     )
     await c.answer()
 
@@ -2284,7 +2493,7 @@ async def cb_newpost(c: CallbackQuery, state: FSMContext):
     await state.update_data(chat_id=chat_id, media_type=None, media_id=None)
     await state.set_state(Form.post_text)
     await c.message.edit_text(
-        "📝 Шаг 1/4. Пришли текст поста, либо фото/видео/документ/альбом "
+        "📝 Шаг 1/5. Пришли текст поста, либо фото/видео/документ/альбом "
         "(можно с подписью).",
         reply_markup=kb.back_kb(f"posts:{chat_id}")
     )
@@ -2346,6 +2555,14 @@ async def in_post_text(message: Message, state: FSMContext):
 
     await message.answer("Пришли текст поста, либо фото/видео/документ/альбом.")
 
+def _poll_options(options):
+    """Готовит список вариантов для send_poll: новые aiogram требуют InputPollOption,
+    старые — список строк. Пробуем новый формат, при неудаче откатываемся на строки."""
+    try:
+        from aiogram.types import InputPollOption
+        return [InputPollOption(text=o) for o in options]
+    except Exception:
+        return list(options)
 
 def _extract_media_item(message: Message):
     """Достаёт из сообщения тип медиа и file_id. Возвращает dict или None."""
@@ -2383,21 +2600,27 @@ async def _finish_album(mgid, message: Message):
 async def _ask_post_button(message: Message, cid, state: FSMContext):
     await state.set_state(Form.post_button)
     await message.answer(
-        "🔘 Шаг 2/4. Кнопка в формате: Название | https://ссылка\n"
+        "🔘 Шаг 2/5. Кнопка в формате: Название | https://ссылка\n"
         "Или нажми «Без кнопки».",
         reply_markup=kb.skip_kb(cid)
     )
 
+async def _ask_post_poll(message: Message, cid, state: FSMContext):
+    await state.set_state(Form.post_poll)
+    await message.answer(
+        "📊 Шаг 3/5. Прикрепить опрос к посту?\n\n"
+        "Пришли опрос в формате:\n"
+        "<code>Вопрос ? Вариант1 ; Вариант2 ; Вариант3</code>\n\n"
+        "Вопрос — до «?», варианты — через «;» (2–10 шт.).\n"
+        "Или нажми «Без опроса».",
+        reply_markup=kb.poll_skip_kb(cid)
+    )
 
 @router.callback_query(F.data.startswith("nobtn:"))
 async def cb_nobtn(c: CallbackQuery, state: FSMContext):
     chat_id = int(c.data.split(":")[1])
     await state.update_data(btn_text=None, btn_url=None)
-    await state.set_state(Form.post_repeat)
-    await c.message.edit_text(
-        "🔁 Шаг 3/4. Как часто публиковать?",
-        reply_markup=kb.repeat_kb(chat_id)
-    )
+    await _ask_post_poll(c.message, chat_id, state)
     await c.answer()
 
 
@@ -2414,11 +2637,92 @@ async def in_post_button(message: Message, state: FSMContext):
         return
     data = await state.get_data()
     await state.update_data(btn_text=bt, btn_url=bu)
+    await _ask_post_poll(message, data["chat_id"], state)
+
+@router.callback_query(F.data.startswith("nopoll:"))
+async def cb_nopoll(c: CallbackQuery, state: FSMContext):
+    chat_id = int(c.data.split(":")[1])
+    await state.update_data(poll_json=None)
     await state.set_state(Form.post_repeat)
-    await message.answer(
-        "🔁 Шаг 3/4. Как часто публиковать?",
-        reply_markup=kb.repeat_kb(data["chat_id"])
+    await c.message.edit_text(
+        "🔁 Шаг 4/5. Как часто публиковать?",
+        reply_markup=kb.repeat_kb(chat_id)
     )
+    await c.answer()
+
+
+@router.message(Form.post_poll)
+async def in_post_poll(message: Message, state: FSMContext):
+    if not is_admin_id(message.from_user.id):
+        return
+    raw = (message.text or "").strip()
+    if "?" not in raw:
+        await message.answer("Формат: Вопрос ? Вариант1 ; Вариант2 ; …")
+        return
+    question, opts_part = raw.split("?", 1)
+    question = question.strip()
+    options = [o.strip() for o in opts_part.split(";") if o.strip()]
+    if not question:
+        await message.answer("Вопрос пустой. Формат: Вопрос ? Вариант1 ; Вариант2")
+        return
+    if not (2 <= len(options) <= 10):
+        await message.answer("Нужно от 2 до 10 вариантов (через «;»).")
+        return
+    if len(question) > 300:
+        await message.answer("Вопрос слишком длинный (макс. 300 символов).")
+        return
+    if any(len(o) > 100 for o in options):
+        await message.answer("Каждый вариант — максимум 100 символов.")
+        return
+    # Сохраняем опрос с настройками по умолчанию: анонимный, одиночный выбор
+    poll_data = {
+        "question": question,
+        "options": options,
+        "is_anonymous": True,
+        "allows_multiple_answers": False,
+    }
+    await state.update_data(poll_json=json.dumps(poll_data, ensure_ascii=False))
+    cid = (await state.get_data())["chat_id"]
+    await message.answer(
+        f"✅ Опрос принят: «{question}» ({len(options)} вар.)\n\n"
+        "⚙️ Настрой опрос или нажми «Готово»:",
+        reply_markup=kb.poll_options_kb(cid, is_anonymous=True, multiple=False)
+    )
+
+@router.callback_query(F.data.startswith("polltgl:"))
+async def cb_poll_toggle(c: CallbackQuery, state: FSMContext):
+    _, what, chat_id = c.data.split(":")
+    chat_id = int(chat_id)
+    data = await state.get_data()
+    raw = data.get("poll_json")
+    if not raw:
+        await c.answer("Опрос не найден, начни заново.", show_alert=True)
+        return
+    poll = json.loads(raw)
+    if what == "anon":
+        poll["is_anonymous"] = not poll.get("is_anonymous", True)
+    elif what == "multi":
+        poll["allows_multiple_answers"] = not poll.get("allows_multiple_answers", False)
+    await state.update_data(poll_json=json.dumps(poll, ensure_ascii=False))
+    await c.message.edit_reply_markup(
+        reply_markup=kb.poll_options_kb(
+            chat_id,
+            is_anonymous=poll.get("is_anonymous", True),
+            multiple=poll.get("allows_multiple_answers", False),
+        )
+    )
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("polldone:"))
+async def cb_poll_done(c: CallbackQuery, state: FSMContext):
+    chat_id = int(c.data.split(":")[1])
+    await state.set_state(Form.post_repeat)
+    await c.message.edit_text(
+        "🔁 Шаг 4/5. Как часто публиковать?",
+        reply_markup=kb.repeat_kb(chat_id)
+    )
+    await c.answer()
 
 @router.callback_query(F.data.startswith("setrepeat:"), Form.post_repeat)
 async def cb_set_repeat(c: CallbackQuery, state: FSMContext):
@@ -2427,7 +2731,7 @@ async def cb_set_repeat(c: CallbackQuery, state: FSMContext):
     await state.set_state(Form.post_time)
     label = {"once": "разово", "daily": "каждый день", "weekly": "каждую неделю"}.get(mode, "разово")
     await c.message.edit_text(
-        f"🕓 Шаг 4/4. Повтор: {label}.\n"
+        f"🕓 Шаг 5/5. Повтор: {label}.\n"
         f"Дата и время первой публикации: ДД.ММ.ГГГГ ЧЧ:ММ\n"
         f"Например: {datetime.now(TZ).strftime('%d.%m.%Y')} 20:00 (UTC+{TIMEZONE_OFFSET})",
         reply_markup=kb.back_kb(f"posts:{chat_id}")
@@ -2461,6 +2765,7 @@ async def in_post_time(message: Message, state: FSMContext):
             data.get("post_text") or "",
             data.get("btn_text"), data.get("btn_url"),
             data.get("media_type"), data.get("media_id"),
+            data.get("poll_json"),
         )
     except Exception as e:
         logger.warning("Предпросмотр поста не удался: %s", e)
@@ -2506,9 +2811,10 @@ async def _edit_published(bot, chat_id, message_id, new_text, media_type, btn_te
                        message_id, chat_id, e)
         return False
 
-async def _send_post(bot, chat_id, text, btn_text, btn_url, media_type, media_id):
-    """Отправляет пост (текст/медиа/альбом) в указанный chat_id так,
-    как он будет выглядеть в канале. Используется для предпросмотра."""
+async def _send_post(bot, chat_id, text, btn_text, btn_url, media_type, media_id,
+                     poll_json=None):
+    """Отправляет пост (текст/медиа/альбом) и, при наличии, опрос отдельным сообщением.
+    Используется и для предпросмотра, и из меню."""
     keyboard = None
     if btn_text and btn_url:
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -2535,8 +2841,22 @@ async def _send_post(bot, chat_id, text, btn_text, btn_url, media_type, media_id
         await bot.send_media_group(chat_id, media)
         if keyboard:
             await bot.send_message(chat_id, text or "⬆️", reply_markup=keyboard)
-    else:
+    elif text:
         await bot.send_message(chat_id, text or "(пустой пост)", reply_markup=keyboard)
+
+    # Прикреплённый опрос — отдельным сообщением
+    if poll_json:
+        try:
+            poll = json.loads(poll_json)
+            await bot.send_poll(
+                chat_id,
+                question=poll["question"],
+                options=_poll_options(poll["options"]),
+                is_anonymous=poll.get("is_anonymous", True),
+                allows_multiple_answers=poll.get("allows_multiple_answers", False),
+            )
+        except Exception as e:
+            logger.warning("Не удалось отправить опрос (предпросмотр) в %s: %s", chat_id, e)
 
 @router.callback_query(F.data.startswith("postsave:"), Form.post_confirm)
 async def cb_post_save(c: CallbackQuery, state: FSMContext):
@@ -2556,6 +2876,7 @@ async def cb_post_save(c: CallbackQuery, state: FSMContext):
         media_type=data.get("media_type"),
         media_id=data.get("media_id"),
         repeat_mode=data.get("repeat_mode", "once"),
+        poll_json=data.get("poll_json"),
     )
     await state.clear()
     dt = datetime.fromtimestamp(pub, TZ)
@@ -2579,9 +2900,9 @@ async def cb_post_cancel(c: CallbackQuery, state: FSMContext):
 def _format_post_card(post):
     """Собирает текстовое описание поста для карточки.
     post = (id, chat_id, text, btn_text, btn_url, publish_at, media_type,
-            media_id, repeat_mode, sent_message_id)"""
+            media_id, repeat_mode, sent_message_id, poll_json)"""
     (_id, _cid, text, btn_text, btn_url, publish_at, media_type,
-     media_id, repeat_mode, sent_message_id) = post
+     media_id, repeat_mode, sent_message_id, poll_json) = post
     media_names = {"photo": "🖼 Фото", "video": "🎬 Видео",
                    "document": "📎 Документ", "album": "🗂 Альбом"}
     repeat_names = {"once": "разово", "daily": "каждый день", "weekly": "каждую неделю"}
@@ -2592,6 +2913,19 @@ def _format_post_card(post):
     lines.append(f"📦 Тип: {media_names.get(media_type, '📝 Текст')}")
     if btn_text and btn_url:
         lines.append(f"🔘 Кнопка: {btn_text} → {btn_url}")
+    if poll_json:
+        try:
+            _p = json.loads(poll_json)
+            tags = []
+            tags.append("анонимный" if _p.get("is_anonymous", True) else "публичный")
+            if _p.get("allows_multiple_answers", False):
+                tags.append("мультивыбор")
+            lines.append(
+                f"📊 Опрос: {_p['question']} ({len(_p['options'])} вар., "
+                f"{', '.join(tags)})"
+            )
+        except Exception:
+            pass
     body = text or "<i>(без текста)</i>"
     if len(body) > 500:
         body = body[:500] + "…"

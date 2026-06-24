@@ -17,6 +17,14 @@ from config import ADMIN_ID
 
 logger = logging.getLogger(__name__)
 
+def _poll_options(options):
+    """Совместимость версий aiogram: InputPollOption или список строк."""
+    try:
+        from aiogram.types import InputPollOption
+        return [InputPollOption(text=o) for o in options]
+    except Exception:
+        return list(options)
+
 def _build_album(media_id_json, caption):
     """Из JSON-списка {type, file_id} собирает список InputMedia* для send_media_group.
     Подпись ставится только на первый элемент."""
@@ -70,10 +78,21 @@ async def backup_task(bot: Bot, interval_hours: int = 24):
         await asyncio.sleep(interval_hours * 3600)
 
 async def scheduler(bot: Bot):
+    _cleanup_counter = 0
     while True:
+        # Раз в ~сутки чистим старые завершённые посты (20с * 4320 ≈ 24ч)
+        _cleanup_counter += 1
+        if _cleanup_counter >= 4320:
+            _cleanup_counter = 0
+            try:
+                removed = await db.delete_old_posts(30)
+                if removed:
+                    logger.info("Автоочистка: удалено старых постов: %s", removed)
+            except Exception as e:
+                logger.warning("Автоочистка постов не удалась: %s", e)
         try:
             for (post_id, chat_id, text, btn_text, btn_url,
-                 media_type, media_id, repeat_mode) in await db.get_due_posts():
+                 media_type, media_id, repeat_mode, poll_json) in await db.get_due_posts():
                 keyboard = None
                 if btn_text and btn_url:
                     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -96,20 +115,34 @@ async def scheduler(bot: Bot):
                     elif media_type == "album":
                         media = _build_album(media_id, text)
                         msgs = await bot.send_media_group(chat_id, media)
-                        # подпись альбома живёт в первом сообщении
-                        if msgs:
-                            sent_id = msgs[0].message_id
+                        sent_id = msgs[0].message_id if msgs else None
                         # У альбома не бывает инлайн-кнопки — шлём её отдельным сообщением
                         if keyboard:
                             await bot.send_message(chat_id, text or "⬆️",
                                                    reply_markup=keyboard)
-                    else:
+                    elif text:
                         m = await bot.send_message(chat_id, text, reply_markup=keyboard)
                         sent_id = m.message_id
 
+                    # Прикреплённый опрос (если задан)
+                    if poll_json:
+                        try:
+                            poll = json.loads(poll_json)
+                            poll_msg = await bot.send_poll(
+                                chat_id,
+                                question=poll["question"],
+                                options=_poll_options(poll["options"]),
+                                is_anonymous=poll.get("is_anonymous", True),
+                                allows_multiple_answers=poll.get("allows_multiple_answers", False),
+                            )
+                            if sent_id is None:
+                                sent_id = poll_msg.message_id
+                        except Exception as pe:
+                            logger.warning("Опрос для поста %s не отправлен: %s", post_id, pe)
+
                     # Запоминаем id опубликованного сообщения (для редактирования)
                     if sent_id is not None:
-                        await db.set_sent_message_id(post_id, sent_id)
+                        await db.set_post_sent_id(post_id, sent_id)
 
                     # Повтор или завершение
                     if repeat_mode == "daily":
@@ -120,7 +153,11 @@ async def scheduler(bot: Bot):
                         await db.mark_post(post_id, "published")
 
                     try:
-                        await bot.send_message(ADMIN_ID, "✅ Опубликован отложенный пост.")
+                        chat = await db.get_chat(chat_id)
+                        title = chat[1] if chat else str(chat_id)
+                        await bot.send_message(
+                            ADMIN_ID, f"✅ Опубликован отложенный пост в «{title}»."
+                        )
                     except Exception:
                         pass
                 except Exception as e:

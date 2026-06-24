@@ -12,6 +12,7 @@ async def setup_commands(bot: Bot):
         BotCommand(command="start", description="Открыть меню"),
         BotCommand(command="menu", description="Управление каналами и группами"),
         BotCommand(command="reactall", description="Реакции на старые посты канала"),
+        BotCommand(command="backup", description="Резервная копия базы"),
     ]
 
     # Команды для админов в группах/супергруппах (видны только администраторам чата)
