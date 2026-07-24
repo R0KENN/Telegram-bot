@@ -54,6 +54,7 @@ URL_RE = re.compile(r'(https?://[^\s]+|www\.[^\s]+|t\.me/[^\s]+|@\w+)', re.IGNOR
 
 class Form(StatesGroup):
     welcome_text = State()
+    welcome_media = State()
     welcome_delay = State()
     wbtn_text = State()
     wbtn_url = State()
@@ -831,22 +832,181 @@ async def notify_admin(bot, request: ChatJoinRequest, approved: bool):
     await send_chat_log(bot, request.chat.id, text)
 
 
-async def send_delayed_welcome(bot, chat_id, user_id):
-    if await db.get_setting(chat_id, "welcome_enabled") != "1":
-        return
-    delay = int(await db.get_setting(chat_id, "welcome_delay"))
-    await asyncio.sleep(delay)
-    text = await db.get_setting(chat_id, "welcome_text")
+async def send_welcome(bot, chat_id, user_id):
+    text = await db.get_setting(chat_id, "welcome_text") or ""
+    media_type = await db.get_setting(chat_id, "welcome_media_type")
+    media_id = await db.get_setting(chat_id, "welcome_media_id")
     buttons = await db.get_welcome_buttons(chat_id)
     keyboard = None
     if buttons:
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=t, url=u)] for _, t, u in buttons
         ])
-    try:
+
+    if not media_type or not media_id:
+        await bot.send_message(user_id, text or "👋", reply_markup=keyboard)
+        return
+
+    caption = text if len(text) <= 1024 else None
+    media_keyboard = keyboard if caption is not None else None
+
+    if media_type == "photo":
+        await bot.send_photo(
+            user_id,
+            media_id,
+            caption=caption,
+            reply_markup=media_keyboard,
+        )
+    elif media_type == "video":
+        await bot.send_video(
+            user_id,
+            media_id,
+            caption=caption,
+            reply_markup=media_keyboard,
+        )
+    elif media_type == "animation":
+        await bot.send_animation(
+            user_id,
+            media_id,
+            caption=caption,
+            reply_markup=media_keyboard,
+        )
+    elif media_type == "document":
+        await bot.send_document(
+            user_id,
+            media_id,
+            caption=caption,
+            reply_markup=media_keyboard,
+        )
+    else:
+        await bot.send_message(user_id, text or "👋", reply_markup=keyboard)
+        return
+
+    if caption is None and text:
         await bot.send_message(user_id, text, reply_markup=keyboard)
-    except Exception:
-        pass
+
+
+async def send_delayed_welcome(bot, chat_id, user_id):
+    if await db.get_setting(chat_id, "welcome_enabled") != "1":
+        return
+    delay = int(await db.get_setting(chat_id, "welcome_delay"))
+    await asyncio.sleep(delay)
+    try:
+        await send_welcome(bot, chat_id, user_id)
+    except Exception as e:
+        logger.warning(
+            "Не удалось отправить приветствие пользователю %s для чата %s: %s",
+            user_id,
+            chat_id,
+            e,
+        )
+
+
+@router.callback_query(F.data.startswith("wmedia:"))
+async def cb_welcome_media(c: CallbackQuery, state: FSMContext):
+    if not is_admin_id(c.from_user.id):
+        await c.answer()
+        return
+    chat_id = int(c.data.split(":")[1])
+    await state.update_data(welcome_media_chat_id=chat_id)
+    await state.set_state(Form.welcome_media)
+    remove_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="🗑 Удалить медиа",
+            callback_data=f"wmediadel:{chat_id}",
+        )],
+        [InlineKeyboardButton(
+            text="⬅️ Назад",
+            callback_data=f"wmenu:{chat_id}",
+        )],
+    ])
+    await c.message.edit_text(
+        "🖼 <b>Медиа приветствия</b>\n\n"
+        "Пришли одно фото, видео, GIF или документ.\n\n"
+        "Медиа будет отправляться вместе с текстом и кнопками приветствия.",
+        reply_markup=remove_keyboard,
+    )
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("wmediadel:"))
+async def cb_welcome_media_delete(c: CallbackQuery, state: FSMContext):
+    if not is_admin_id(c.from_user.id):
+        await c.answer()
+        return
+    chat_id = int(c.data.split(":")[1])
+    await db.set_setting(chat_id, "welcome_media_type", "")
+    await db.set_setting(chat_id, "welcome_media_id", "")
+    await state.clear()
+    await c.message.edit_text(
+        "✅ Медиа приветствия удалено.",
+        reply_markup=await kb.welcome_menu_kb(chat_id),
+    )
+    await c.answer()
+
+
+@router.message(Form.welcome_media)
+async def in_welcome_media(message: Message, state: FSMContext):
+    if not is_admin_id(message.from_user.id):
+        return
+    data = await state.get_data()
+    chat_id = data.get("welcome_media_chat_id")
+    if not chat_id:
+        await state.clear()
+        await message.answer("⚠️ Не удалось определить канал. Открой /menu ещё раз.")
+        return
+
+    media_type = None
+    media_id = None
+
+    if message.photo:
+        media_type = "photo"
+        media_id = message.photo[-1].file_id
+    elif message.video:
+        media_type = "video"
+        media_id = message.video.file_id
+    elif message.animation:
+        media_type = "animation"
+        media_id = message.animation.file_id
+    elif message.document:
+        media_type = "document"
+        media_id = message.document.file_id
+
+    if not media_type or not media_id:
+        await message.answer(
+            "Пришли фото, видео, GIF или документ.\n"
+            "Для выхода открой /menu."
+        )
+        return
+
+    await db.set_setting(chat_id, "welcome_media_type", media_type)
+    await db.set_setting(chat_id, "welcome_media_id", media_id)
+    await state.clear()
+    await message.answer(
+        "✅ Медиа приветствия сохранено.",
+        reply_markup=await kb.welcome_menu_kb(chat_id),
+    )
+
+
+@router.callback_query(F.data.startswith("wpreview:"))
+async def cb_welcome_preview(c: CallbackQuery):
+    if not is_admin_id(c.from_user.id):
+        await c.answer()
+        return
+    chat_id = int(c.data.split(":")[1])
+    try:
+        await send_welcome(c.bot, chat_id, c.from_user.id)
+        await c.answer("Предпросмотр отправлен")
+    except Exception as e:
+        logger.warning(
+            "Не удалось показать приветствие для чата %s: %s",
+            chat_id,
+            e,
+        )
+        await c.answer(
+            "Не удалось отправить предпросмотр. Проверь медиа.",
+            show_alert=True,
+        )
 
 
 # ============================================================

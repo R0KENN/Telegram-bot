@@ -57,13 +57,16 @@ async def chat_menu_kb(chat_id):
 # --- приветствие в личку (каналы) ---
 async def welcome_menu_kb(chat_id):
     enabled = await db.get_setting(chat_id, "welcome_enabled") == "1"
+    media_type = await db.get_setting(chat_id, "welcome_media_type")
     toggle = "🟢 Приветствие: ВКЛ" if enabled else "🔴 Приветствие: ВЫКЛ"
+    media_label = "🖼 Медиа: добавлено" if media_type else "🖼 Добавить медиа"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=toggle, callback_data=f"wtoggle:{chat_id}")],
         [InlineKeyboardButton(text="✏️ Текст", callback_data=f"st:{chat_id}")],
+        [InlineKeyboardButton(text=media_label, callback_data=f"wmedia:{chat_id}")],
         [InlineKeyboardButton(text="⏱ Задержка", callback_data=f"sd:{chat_id}")],
         [InlineKeyboardButton(text="🔘 Кнопки", callback_data=f"wbtns:{chat_id}")],
-        [InlineKeyboardButton(text="👁 Проверить", callback_data=f"show:{chat_id}")],
+        [InlineKeyboardButton(text="👁 Проверить", callback_data=f"wpreview:{chat_id}")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"ch:{chat_id}")],
     ])
 
