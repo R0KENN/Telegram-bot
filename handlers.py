@@ -61,7 +61,23 @@ _bg_tasks: set = set()
 def create_background_task(coro):
     task = asyncio.create_task(coro)
     _bg_tasks.add(task)
-    task.add_done_callback(_bg_tasks.discard)
+
+    def task_done(done_task):
+        _bg_tasks.discard(done_task)
+        if done_task.cancelled():
+            return
+        try:
+            error = done_task.exception()
+        except asyncio.CancelledError:
+            return
+        if error:
+            logger.error(
+                "Фоновая задача завершилась с ошибкой: %s",
+                error,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+
+    task.add_done_callback(task_done)
     return task
 
 
@@ -192,22 +208,22 @@ def _format_rights_report(title, status, rights, error, chat_type):
                  "(управление администраторами → этот бот).")
     return "\n".join(lines)
 
-async def safe_send(bot, chat_id, text, **kwargs):
+async def safe_copy(message, chat_id):
     """
-    Безопасная отправка сообщения.
+    Безопасно копирует исходное сообщение получателю.
     Возвращает:
     True — сообщение доставлено;
     False — пользователь заблокировал бота;
     None — временная или неизвестная ошибка.
     """
     try:
-        await bot.send_message(chat_id, text, **kwargs)
+        await message.copy_to(chat_id)
         return True
     except TelegramRetryAfter as e:
         logger.info("Флуд-лимит, ждём %s сек перед повтором для %s", e.retry_after, chat_id)
         await asyncio.sleep(e.retry_after)
         try:
-            await bot.send_message(chat_id, text, **kwargs)
+            await message.copy_to(chat_id)
             return True
         except TelegramForbiddenError:
             return False
@@ -217,7 +233,7 @@ async def safe_send(bot, chat_id, text, **kwargs):
     except TelegramForbiddenError:
         return False
     except Exception as e:
-        logger.warning("Не удалось отправить сообщение в %s: %s", chat_id, e)
+        logger.warning("Не удалось скопировать сообщение в %s: %s", chat_id, e)
         return None
 
 async def send_chat_log(bot, chat_id, text, reply_markup=None):
@@ -503,7 +519,22 @@ async def _put_reaction(bot, chat_id, message_id, emoji):
         return True
     except TelegramRetryAfter as e:
         await asyncio.sleep(e.retry_after)
-        return False
+        try:
+            await bot.set_message_reaction(
+                chat_id=chat_id,
+                message_id=message_id,
+                reaction=[ReactionTypeEmoji(emoji=emoji)],
+            )
+            await db.mark_reacted(chat_id, message_id)
+            return True
+        except Exception as retry_error:
+            logger.warning(
+                "Повторная установка реакции в чат %s на сообщение %s не удалась: %s",
+                chat_id,
+                message_id,
+                retry_error,
+            )
+            return False
     except Exception as e:
         # удалённое/сервисное/несуществующее сообщение или нет прав
         logger.warning("Не удалось поставить реакцию в чат %s на сообщение %s: %s",
@@ -1565,7 +1596,7 @@ async def on_new_member(message: Message):
 
         # Обычное приветствие (если капча выключена или не сработала)
         if welcome_on:
-            text = text_tmpl.replace("{name}", member.full_name)
+            text = text_tmpl.replace("{name}", html.escape(member.full_name))
             try:
                 sent = await message.answer(text)
                 if ttl > 0:
@@ -1588,11 +1619,18 @@ async def _start_captcha(message: Message, chat_id, member):
     Возвращает True, если капча реально выставлена (бот смог ограничить).
     """
     bot = message.bot
+    timeout = int(await db.get_setting(chat_id, "captcha_timeout"))
+    action = await db.get_setting(chat_id, "captcha_action")
+    restriction_until = None
+    if action == "kick":
+        restriction_until = datetime.now(TZ) + timedelta(seconds=max(timeout, 31))
+
     # 1) Забираем право писать
     try:
         await bot.restrict_chat_member(
             chat_id, member.id,
             permissions=ChatPermissions(can_send_messages=False),
+            until_date=restriction_until,
         )
     except Exception as e:
         # Бот не админ / нет права ограничивать — капчу не применяем
@@ -1601,13 +1639,12 @@ async def _start_captcha(message: Message, chat_id, member):
         return False
 
     # 2) Шлём сообщение с кнопкой
-    timeout = int(await db.get_setting(chat_id, "captcha_timeout"))
     kb_captcha = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Я не бот", callback_data=f"cap:{chat_id}:{member.id}")]
     ])
     try:
         sent = await message.answer(
-            f"👋 {member.full_name}, подтверди, что ты человек — нажми кнопку ниже "
+            f"👋 {html.escape(member.full_name)}, подтверди, что ты человек — нажми кнопку ниже "
             f"в течение {timeout} сек, иначе будешь удалён.",
             reply_markup=kb_captcha,
         )
@@ -1723,7 +1760,7 @@ async def cb_captcha_pass(c: CallbackQuery):
     if await db.get_setting(chat_id, "group_welcome_enabled") == "1":
         text_tmpl = await db.get_setting(chat_id, "group_welcome_text")
         ttl = int(await db.get_setting(chat_id, "group_welcome_ttl"))
-        text = text_tmpl.replace("{name}", c.from_user.full_name)
+        text = text_tmpl.replace("{name}", html.escape(c.from_user.full_name))
         try:
             sent = await c.bot.send_message(chat_id, text)
             if ttl > 0:
@@ -2685,14 +2722,13 @@ async def in_broadcast(message: Message, state: FSMContext):
         return
     data = await state.get_data()
     cid = data["chat_id"]
-    if not (message.text or message.caption):
+    if message.media_group_id:
         await message.answer(
-            "Для рассылки нужен текст. Пришли текстовое сообщение "
-            "или медиа с подписью."
+            "Альбомы в рассылке пока не поддерживаются. "
+            "Пришли одно сообщение, фото, видео или документ."
         )
         return
     await state.clear()
-    text = message.html_text
     ids = await db.get_member_ids(cid)
     if not ids:
         await message.answer("Нет получателей.", reply_markup=await kb.chat_menu_kb(cid))
@@ -2701,7 +2737,7 @@ async def in_broadcast(message: Message, state: FSMContext):
     sent, failed = 0, 0
     dead = []  # кто заблокировал бота — удалим из базы
     for uid in ids:
-        ok = await safe_send(message.bot, uid, text)
+        ok = await safe_copy(message, uid)
         if ok is True:
             sent += 1
         elif ok is False:
