@@ -1,3 +1,4 @@
+import os
 import time
 
 import aiosqlite
@@ -93,6 +94,19 @@ async def init_db():
         if "poll_json" not in cols:
             await db.execute("ALTER TABLE posts ADD COLUMN poll_json TEXT")
 
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_members_chat_joined "
+            "ON members(chat_id, joined_at)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_posts_status_time "
+            "ON posts(status, publish_at)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_posts_chat_status "
+            "ON posts(chat_id, status)"
+        )
+
         await db.commit()
 
 
@@ -157,8 +171,12 @@ async def set_setting(chat_id, key, value):
 
 
 async def reset_settings(chat_id):
+    """Сбрасывает настройки чата, но сохраняет привязку к теме логов."""
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM settings WHERE chat_id=?", (chat_id,))
+        await db.execute(
+            "DELETE FROM settings WHERE chat_id=? AND key != 'log_thread_id'",
+            (chat_id,)
+        )
         await db.commit()
 
 
@@ -170,7 +188,10 @@ async def is_auto_approve(chat_id):
 async def save_member(chat_id, user_id, full_name, username):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT OR REPLACE INTO members VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO members (chat_id, user_id, full_name, username, joined_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(chat_id, user_id) DO UPDATE SET "
+            "full_name=excluded.full_name, username=excluded.username",
             (chat_id, user_id, full_name, username, int(time.time()))
         )
         await db.commit()
@@ -464,6 +485,14 @@ async def delete_banned_word(word_id, chat_id):
 async def add_topic(chat_id, thread_id, name):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
+            "DELETE FROM topics WHERE chat_id=? AND thread_id=?",
+            (chat_id, thread_id)
+        )
+        await db.execute(
+            "DELETE FROM topics WHERE chat_id=? AND thread_id=?",
+            (chat_id, thread_id)
+        )
+        await db.execute(
             "INSERT INTO topics (chat_id, thread_id, name) VALUES (?, ?, ?)",
             (chat_id, thread_id, name)
         )
@@ -666,8 +695,9 @@ async def count_chats_with_log_thread():
     """Сколько управляемых чатов имеют привязанную тему логов."""
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT COUNT(*) FROM settings "
-            "WHERE key='log_thread_id' AND value != '' AND chat_id != 0"
+            "SELECT COUNT(*) FROM settings s "
+            "WHERE s.key='log_thread_id' AND s.value != '' AND s.chat_id != 0 "
+            "AND EXISTS (SELECT 1 FROM chats c WHERE c.chat_id = s.chat_id)"
         ) as cur:
             return (await cur.fetchone())[0]
 
@@ -675,6 +705,12 @@ async def count_chats_with_log_thread():
 # ====== БЭКАП ======
 async def make_backup(dest_path):
     """Делает целостную копию БД в dest_path (безопасно при WAL)."""
+    import os
+    # VACUUM INTO требует, чтобы целевого файла не существовало
+    if os.path.exists(dest_path):
+        os.remove(dest_path)
+    if os.path.exists(dest_path):
+        os.remove(dest_path)
     async with aiosqlite.connect(DB_PATH) as db:
         # VACUUM INTO создаёт консистентную копию, не мешая рабочей базе
         await db.execute("VACUUM INTO ?", (dest_path,))

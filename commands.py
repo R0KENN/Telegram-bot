@@ -3,12 +3,20 @@ from aiogram.types import (
     BotCommand,
     BotCommandScopeAllPrivateChats,
     BotCommandScopeAllChatAdministrators,
+    BotCommandScopeChat,
 )
+
+from config import ADMIN_ID
 
 
 async def setup_commands(bot: Bot):
-    # Команды в личке (видны всем, кто открыл бота в ЛС)
+    # Команды в личке для обычных пользователей
     private_cmds = [
+        BotCommand(command="start", description="Открыть меню"),
+    ]
+
+    # Полный набор — только владельцу бота
+    owner_cmds = [
         BotCommand(command="start", description="Открыть меню"),
         BotCommand(command="menu", description="Управление каналами и группами"),
         BotCommand(command="reactall", description="Реакции на старые посты канала"),
@@ -28,3 +36,7 @@ async def setup_commands(bot: Bot):
 
     await bot.set_my_commands(private_cmds, scope=BotCommandScopeAllPrivateChats())
     await bot.set_my_commands(admin_cmds, scope=BotCommandScopeAllChatAdministrators())
+    try:
+        await bot.set_my_commands(owner_cmds, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
+    except Exception:
+        pass  # админ ещё не открывал бота в ЛС

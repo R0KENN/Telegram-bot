@@ -138,10 +138,15 @@ async def scheduler(bot: Bot):
                         await db.set_post_sent_id(post_id, sent_id)
 
                     # Повтор или завершение
-                    if repeat_mode == "daily":
-                        await db.reschedule_post(post_id, int(time.time()) + 86400)
-                    elif repeat_mode == "weekly":
-                        await db.reschedule_post(post_id, int(time.time()) + 7 * 86400)
+                    if repeat_mode in ("daily", "weekly"):
+                        step = 86400 if repeat_mode == "daily" else 7 * 86400
+                        post_row = await db.get_post(post_id)
+                        next_at = (post_row[5] if post_row else int(time.time())) + step
+                        now_ts = int(time.time())
+                        # если бот простаивал — догоняем сетку, а не публикуем пачкой
+                        while next_at <= now_ts:
+                            next_at += step
+                        await db.reschedule_post(post_id, next_at)
                     else:
                         await db.mark_post(post_id, "published")
 
@@ -154,7 +159,13 @@ async def scheduler(bot: Bot):
                     except Exception:
                         pass
                 except Exception as e:
-                    await db.mark_post(post_id, "failed")
+                    # для повторяющихся постов не убиваем всю серию — переносим на след. раз
+                    if repeat_mode == "daily":
+                        await db.reschedule_post(post_id, int(time.time()) + 86400)
+                    elif repeat_mode == "weekly":
+                        await db.reschedule_post(post_id, int(time.time()) + 7 * 86400)
+                    else:
+                        await db.mark_post(post_id, "failed")
                     logger.error(f"Не удалось опубликовать пост {post_id}: {e}")
                     try:
                         await bot.send_message(

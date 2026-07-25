@@ -49,6 +49,16 @@ async def main():
     ]
     dp["background_tasks"] = background_tasks
 
+    def _task_done(task: asyncio.Task):
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc:
+            logger.error("Фоновая задача %s упала: %s", task.get_name(), exc)
+
+    for _t in background_tasks:
+        _t.add_done_callback(_task_done)
+
     logger.info("Бот запущен")
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 

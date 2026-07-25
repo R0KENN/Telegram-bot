@@ -73,11 +73,11 @@ async def welcome_menu_kb(chat_id):
 
 async def welcome_buttons_kb(chat_id):
     rows = []
-    for bid, text, url in await db.get_welcome_buttons(chat_id):
+    buttons = await db.get_welcome_buttons(chat_id)
+    for bid, text, url in buttons:
         rows.append([InlineKeyboardButton(
             text=f"🗑 {text}", callback_data=f"delwbtn:{chat_id}:{bid}"
         )])
-    buttons = await db.get_welcome_buttons(chat_id)
     if len(buttons) < 4:
         rows.append([InlineKeyboardButton(text="➕ Добавить кнопку", callback_data=f"addwbtn:{chat_id}")])
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"wmenu:{chat_id}")])
@@ -135,12 +135,12 @@ async def group_welcome_kb(chat_id):
 
 
 # --- посты ---
-# --- посты ---
 async def posts_menu_kb(chat_id):
     rows = [[InlineKeyboardButton(text="➕ Новый отложенный пост", callback_data=f"newpost:{chat_id}")]]
     media_icons = {"photo": "🖼", "video": "🎬", "document": "📎", "album": "🗂"}
     repeat_icons = {"daily": "📅", "weekly": "🗓"}
-    for pid, text, publish_at, media_type, repeat_mode in await db.get_pending_posts(chat_id):
+    pending = await db.get_pending_posts(chat_id)
+    for pid, text, publish_at, media_type, repeat_mode in pending[:30]:
         when = datetime.fromtimestamp(publish_at, TZ).strftime("%d.%m %H:%M")
         base = text or ""
         preview = (base[:18] + "…") if len(base) > 18 else (base or "медиа")
@@ -149,6 +149,11 @@ async def posts_menu_kb(chat_id):
         rows.append([InlineKeyboardButton(
             text=f"{ricon}{micon} {when} | {preview}".replace("\n", " "),
             callback_data=f"postcard:{chat_id}:{pid}"
+        )])
+    if len(pending) > 30:
+        rows.append([InlineKeyboardButton(
+            text=f"… ещё {len(pending) - 30}, показаны ближайшие 30",
+            callback_data=f"posts:{chat_id}"
         )])
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"ch:{chat_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -219,8 +224,8 @@ def poll_skip_kb(chat_id):
 def poll_options_kb(chat_id, is_anonymous=True, multiple=False, is_channel=True):
     multi_label = "☑️ Несколько ответов: ВКЛ" if multiple else "☑️ Несколько ответов: ВЫКЛ"
     rows = []
+    # В каналах публичные опросы запрещены Telegram — переключатель показываем только в группах.
     if not is_channel:
-        # В каналах публичные опросы запрещены Telegram — переключатель скрыт.
         anon_label = "👁 Анонимный: ВКЛ" if is_anonymous else "👁 Анонимный: ВЫКЛ"
         rows.append([InlineKeyboardButton(text=anon_label, callback_data=f"polltgl:anon:{chat_id}")])
     rows.append([InlineKeyboardButton(text=multi_label, callback_data=f"polltgl:multi:{chat_id}")])
@@ -287,7 +292,7 @@ async def log_topic_kb(chat_id):
                     cur_name = t_name
                     break
         rows.append([InlineKeyboardButton(
-            text=f"Текущая тема: {cur_name}", callback_data=f"logtopic:{chat_id}"
+            text=f"Текущая тема: {cur_name}", callback_data=f"picklogtopic:{chat_id}"
         )])
         rows.append([InlineKeyboardButton(
             text="📋 Выбрать тему", callback_data=f"picklogtopic:{chat_id}"

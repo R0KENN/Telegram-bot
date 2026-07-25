@@ -2137,6 +2137,11 @@ async def cb_delchat(c: CallbackQuery):
 @router.callback_query(F.data.startswith("delchatok:"))
 async def cb_delchat_ok(c: CallbackQuery):
     chat_id = int(c.data.split(":")[1])
+    # убираем запись о теме логов этого чата в лог-группе
+    log_chat = await db.get_global_log_chat()
+    thread_id = await db.get_log_thread(chat_id)
+    if log_chat and thread_id:
+        await db.delete_topics_by_thread(log_chat, thread_id)
     await db.delete_chat(chat_id)
     await c.message.edit_text("✅ Удалено из списка.", reply_markup=await kb.chats_kb())
     await c.answer("Удалено")
