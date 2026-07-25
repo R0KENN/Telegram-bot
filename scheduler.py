@@ -150,11 +150,14 @@ async def scheduler(bot: Bot):
                     else:
                         await db.mark_post(post_id, "published")
 
+                    if sent_id is None:
+                        logger.warning("Пост %s пуст — публиковать нечего", post_id)
                     try:
                         chat = await db.get_chat(chat_id)
                         title = chat[1] if chat else str(chat_id)
+                        status_word = "Опубликован" if sent_id is not None else "Пропущен (пустой)"
                         await bot.send_message(
-                            ADMIN_ID, f"✅ Опубликован отложенный пост в «{title}»."
+                            ADMIN_ID, f"✅ {status_word} отложенный пост в «{title}»."
                         )
                     except Exception:
                         pass

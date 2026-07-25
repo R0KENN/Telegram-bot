@@ -17,7 +17,7 @@ from aiogram.types import (
     ReactionTypeEmoji, ChatPermissions, BufferedInputFile,
     InputMediaPhoto, InputMediaVideo, InputMediaDocument
 )
-from aiogram.filters import Command, StateFilter
+from aiogram.filters import Command, CommandObject, StateFilter
 from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -54,6 +54,8 @@ _flood_tracker: dict[tuple[int, int], list[float]] = {}
 _flood_muted: set[tuple[int, int]] = set()
 # Буфер для сборки альбомов при создании поста: {media_group_id: {"items": [...], "task": Task, ...}}
 _album_buffer: dict[str, dict] = {}
+# Фоновые задачи (реакции, приветствия): держим ссылки, иначе GC может убить задачу
+_bg_tasks: set = set()
 
 URL_RE = re.compile(r'(https?://[^\s]+|www\.[^\s]+|t\.me/[^\s]+|@\w+)', re.IGNORECASE)
 
@@ -307,6 +309,9 @@ async def cmd_menu(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "chats")
 async def cb_chats(c: CallbackQuery, state: FSMContext):
+    if not is_admin_id(c.from_user.id):
+        await c.answer()
+        return
     await state.clear()
     await c.message.edit_text("<b>Твои каналы и группы:</b>", reply_markup=await kb.chats_kb())
     await c.answer()
@@ -390,6 +395,9 @@ async def cb_rights(c: CallbackQuery):
 
 @router.callback_query(F.data == "addch")
 async def cb_addch(c: CallbackQuery):
+    if not is_admin_id(c.from_user.id):
+        await c.answer()
+        return
     await c.message.edit_text(
         "➕ <b>Добавление</b>\n\n"
         "<b>Канал:</b> добавь бота админом в канал и перешли мне любой пост оттуда.\n\n"
@@ -416,7 +424,6 @@ async def on_forward(message: Message):
     await message.answer(f"✅ Канал «{chat.title}» добавлен. Открой /menu.{note}")
 
 
-# Регистрация группы при добавлении бота
 # Регистрация группы при добавлении бота
 @router.my_chat_member()
 async def on_added_to_chat(event: ChatMemberUpdated):
@@ -497,7 +504,9 @@ async def auto_react_channel_post(message: Message):
     if await db.get_setting(chat_id, "auto_reaction") != "1":
         return
     # ставим реакцию не сразу, а через задержку
-    asyncio.create_task(_delayed_react(message.bot, chat_id, message.message_id))
+    _t = asyncio.create_task(_delayed_react(message.bot, chat_id, message.message_id))
+    _bg_tasks.add(_t)
+    _t.add_done_callback(_bg_tasks.discard)
 
 @router.message_reaction_count()
 async def on_reaction_count(event):
@@ -796,6 +805,9 @@ async def cb_clearall(c: CallbackQuery):
 
 @router.callback_query(F.data.startswith("clearallok:"))
 async def cb_clearall_ok(c: CallbackQuery):
+    if not is_admin_id(c.from_user.id):
+        await c.answer()
+        return
     chat_id = int(c.data.split(":")[1])
     if chat_id in _reactall_running:
         await c.answer("По этому каналу уже идёт операция. Дождись отчёта.", show_alert=True)
@@ -896,7 +908,10 @@ async def send_welcome(bot, chat_id, user_id):
 async def send_delayed_welcome(bot, chat_id, user_id):
     if await db.get_setting(chat_id, "welcome_enabled") != "1":
         return
-    delay = int(await db.get_setting(chat_id, "welcome_delay"))
+    try:
+        delay = int(await db.get_setting(chat_id, "welcome_delay") or "120")
+    except ValueError:
+        delay = 120
     await asyncio.sleep(delay)
     try:
         await send_welcome(bot, chat_id, user_id)
@@ -1148,10 +1163,10 @@ async def _clear_flood_flag(key, delay):
 #                   ТЕМЫ ФОРУМА (в супергруппах)
 # ============================================================
 @router.message(Command("newtopic"), F.chat.type == "supergroup")
-async def cmd_newtopic(message: Message):
+async def cmd_newtopic(message: Message, command: CommandObject):
     if not await is_user_admin(message.bot, message.chat.id, message.from_user.id):
         return
-    name = message.text.removeprefix("/newtopic").strip()
+    name = (command.args or "").strip()
     if not name:
         await message.reply("Использование: /newtopic Название темы")
         return
@@ -1186,10 +1201,10 @@ async def cmd_topics(message: Message):
 
 
 @router.message(Command("deltopic"), F.chat.type == "supergroup")
-async def cmd_deltopic(message: Message):
+async def cmd_deltopic(message: Message, command: CommandObject):
     if not await is_user_admin(message.bot, message.chat.id, message.from_user.id):
         return
-    arg = message.text.removeprefix("/deltopic").strip()
+    arg = (command.args or "").strip()
     if not arg.isdigit():
         await message.reply("Использование: /deltopic &lt;id темы&gt; (id смотри в /topics)")
         return
@@ -1217,7 +1232,7 @@ async def cmd_deltopic(message: Message):
 #              КОМАНДЫ ПРЕДУПРЕЖДЕНИЙ (в группах)
 # ============================================================
 @router.message(Command("warn"), F.chat.type.in_({"group", "supergroup"}))
-async def cmd_warn(message: Message):
+async def cmd_warn(message: Message, command: CommandObject):
     if not await is_user_admin(message.bot, message.chat.id, message.from_user.id):
         return
     if not message.reply_to_message or not message.reply_to_message.from_user:
@@ -1230,7 +1245,7 @@ async def cmd_warn(message: Message):
     if await is_user_admin(message.bot, message.chat.id, target.id):
         await message.reply("Это админ — предупреждение не выдаётся.")
         return
-    reason = message.text.removeprefix("/warn").strip() or "вручную админом"
+    reason = (command.args or "").strip() or "вручную админом"
     count = await issue_warn(message.bot, message.chat.id, target, reason)
     await message.reply(f"⚠️ {target.full_name}: предупреждение выдано. Всего: {count}.")
 
@@ -1822,6 +1837,9 @@ async def cb_chart(c: CallbackQuery):
     if not is_admin_id(c.from_user.id):
         await c.answer()
         return
+    if plt is None:
+        await c.answer("Графики недоступны: не установлен matplotlib.", show_alert=True)
+        return
     chat_id = int(c.data.split(":")[1])
     chat = await db.get_chat(chat_id)
     title = chat[1] if chat else str(chat_id)
@@ -2004,7 +2022,7 @@ async def cb_setlogchat(c: CallbackQuery, state: FSMContext):
 async def in_route_log_chat(message: Message, state: FSMContext):
     if not is_admin_id(message.from_user.id):
         return
-    val = message.text.strip()
+    val = (message.text or "").strip()
     if not val.lstrip("-").isdigit():
         await message.answer("Нужен числовой ID группы (например -1001234567890).")
         return
@@ -2181,6 +2199,9 @@ async def cb_st(c: CallbackQuery, state: FSMContext):
 async def in_welcome_text(message: Message, state: FSMContext):
     if not is_admin_id(message.from_user.id):
         return
+    if not (message.text or message.caption):
+        await message.answer("Нужен текст. Пришли текстовое сообщение.")
+        return
     data = await state.get_data()
     cid = data["chat_id"]
     await db.set_setting(cid, "welcome_text", message.html_text)
@@ -2237,6 +2258,9 @@ async def cb_addwbtn(c: CallbackQuery, state: FSMContext):
 async def in_wbtn_text(message: Message, state: FSMContext):
     if not is_admin_id(message.from_user.id):
         return
+    if not message.text:
+        await message.answer("Нужен текст кнопки.")
+        return
     await state.update_data(wbtn_text=message.text.strip())
     await state.set_state(Form.wbtn_url)
     await message.answer("Теперь пришли ссылку (http:// или https://).")
@@ -2246,7 +2270,7 @@ async def in_wbtn_text(message: Message, state: FSMContext):
 async def in_wbtn_url(message: Message, state: FSMContext):
     if not is_admin_id(message.from_user.id):
         return
-    url = message.text.strip()
+    url = (message.text or "").strip()
     if not (url.startswith("http://") or url.startswith("https://")):
         await message.answer("Ссылка должна начинаться с http:// или https://")
         return
@@ -2396,6 +2420,9 @@ async def cb_adddom(c: CallbackQuery, state: FSMContext):
 async def in_domain(message: Message, state: FSMContext):
     if not is_admin_id(message.from_user.id):
         return
+    if not message.text:
+        await message.answer("Пришли домен текстом, например: youtube.com")
+        return
     domain = message.text.strip().lower().replace("http://", "").replace("https://", "").strip("/")
     data = await state.get_data()
     cid = data["chat_id"]
@@ -2496,6 +2523,9 @@ async def cb_gwtext(c: CallbackQuery, state: FSMContext):
 @router.message(Form.gw_text)
 async def in_gw_text(message: Message, state: FSMContext):
     if not is_admin_id(message.from_user.id):
+        return
+    if not (message.text or message.caption):
+        await message.answer("Нужен текст. Пришли текстовое сообщение.")
         return
     data = await state.get_data()
     cid = data["chat_id"]
@@ -3238,6 +3268,9 @@ async def cb_edit_post_text(c: CallbackQuery, state: FSMContext):
 async def in_edit_post_text(message: Message, state: FSMContext):
     if not is_admin_id(message.from_user.id):
         return
+    if not (message.text or message.caption):
+        await message.answer("Нужен текст. Пришли текстовое сообщение.")
+        return
     data = await state.get_data()
     pid = data["edit_post_id"]
     cid = data["edit_chat_id"]
@@ -3270,6 +3303,9 @@ async def cb_edit_post_time(c: CallbackQuery, state: FSMContext):
 @router.message(Form.edit_post_time)
 async def in_edit_post_time(message: Message, state: FSMContext):
     if not is_admin_id(message.from_user.id):
+        return
+    if not message.text:
+        await message.answer("Нужен текст в формате: 25.12.2026 20:00")
         return
     try:
         dt = datetime.strptime(message.text.strip(), "%d.%m.%Y %H:%M").replace(tzinfo=TZ)
@@ -3424,6 +3460,9 @@ async def cb_editpub_text(c: CallbackQuery, state: FSMContext):
 @router.message(Form.edit_pub_text)
 async def in_editpub_text(message: Message, state: FSMContext):
     if not is_admin_id(message.from_user.id):
+        return
+    if not (message.text or message.caption):
+        await message.answer("Нужен текст. Пришли текстовое сообщение.")
         return
     data = await state.get_data()
     pid = data["pub_post_id"]

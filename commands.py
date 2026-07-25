@@ -1,3 +1,5 @@
+import logging
+
 from aiogram import Bot
 from aiogram.types import (
     BotCommand,
@@ -38,5 +40,6 @@ async def setup_commands(bot: Bot):
     await bot.set_my_commands(admin_cmds, scope=BotCommandScopeAllChatAdministrators())
     try:
         await bot.set_my_commands(owner_cmds, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
-    except Exception:
-        pass  # админ ещё не открывал бота в ЛС
+    except Exception as e:
+        # обычно значит, что админ ещё не открывал бота в ЛС
+        logging.getLogger(__name__).warning("Не удалось задать команды владельца: %s", e)

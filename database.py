@@ -223,6 +223,16 @@ async def get_member_ids(chat_id):
             return [r[0] for r in await cur.fetchall()]
 
 
+async def get_all_members(chat_id):
+    """Все участники чата (для экспорта в CSV)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT user_id, full_name, username, joined_at FROM members "
+            "WHERE chat_id=? ORDER BY joined_at", (chat_id,)
+        ) as cur:
+            return await cur.fetchall()
+
+
 
 async def remove_members(chat_id, user_ids):
     """Удаляет из базы участников, которые заблокировали бота / недоступны."""
@@ -489,10 +499,6 @@ async def add_topic(chat_id, thread_id, name):
             (chat_id, thread_id)
         )
         await db.execute(
-            "DELETE FROM topics WHERE chat_id=? AND thread_id=?",
-            (chat_id, thread_id)
-        )
-        await db.execute(
             "INSERT INTO topics (chat_id, thread_id, name) VALUES (?, ?, ?)",
             (chat_id, thread_id, name)
         )
@@ -705,10 +711,7 @@ async def count_chats_with_log_thread():
 # ====== БЭКАП ======
 async def make_backup(dest_path):
     """Делает целостную копию БД в dest_path (безопасно при WAL)."""
-    import os
     # VACUUM INTO требует, чтобы целевого файла не существовало
-    if os.path.exists(dest_path):
-        os.remove(dest_path)
     if os.path.exists(dest_path):
         os.remove(dest_path)
     async with aiosqlite.connect(DB_PATH) as db:
