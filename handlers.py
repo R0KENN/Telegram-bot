@@ -5,6 +5,7 @@ import time
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
 import csv
+import html
 import io
 import json
 from collections import defaultdict
@@ -16,7 +17,7 @@ from aiogram.types import (
     ReactionTypeEmoji, ChatPermissions, BufferedInputFile,
     InputMediaPhoto, InputMediaVideo, InputMediaDocument
 )
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -400,7 +401,7 @@ async def cb_addch(c: CallbackQuery):
 
 
 # Регистрация канала пересылкой
-@router.message(F.forward_from_chat, F.chat.type == ChatType.PRIVATE)
+@router.message(StateFilter(None), F.forward_from_chat, F.chat.type == ChatType.PRIVATE)
 async def on_forward(message: Message):
     if not is_admin_id(message.from_user.id):
         return
@@ -831,8 +832,9 @@ async def notify_admin(bot, request: ChatJoinRequest, approved: bool):
     user = request.from_user
     status = "✅ одобрена" if approved else "⏳ ожидает (автоприём выкл.)"
     text = (
-        f"📥 Заявка в «{request.chat.title}» ({status})\n"
-        f"{user.full_name} | @{user.username or '—'} | <code>{user.id}</code>"
+        f"📥 Заявка в «{html.escape(request.chat.title or '')}» ({status})\n"
+        f"{html.escape(user.full_name)} | @{html.escape(user.username or '—')} "
+        f"| <code>{user.id}</code>"
     )
     await send_chat_log(bot, request.chat.id, text)
 
@@ -1067,8 +1069,8 @@ async def issue_warn(bot, chat_id, user, reason="нарушение"):
 
     await send_chat_log(
         bot, chat_id,
-        f"⚠️ Предупреждение для {user.full_name} "
-        f"(<code>{user.id}</code>): {reason}\n"
+        f"⚠️ Предупреждение для {html.escape(user.full_name)} "
+        f"(<code>{user.id}</code>): {html.escape(reason)}\n"
         f"Всего предупреждений: {count}.{note}"
     )
     return count
@@ -1189,20 +1191,27 @@ async def cmd_deltopic(message: Message):
         return
     arg = message.text.removeprefix("/deltopic").strip()
     if not arg.isdigit():
-        await message.reply("Использование: /deltopic <id темы> (id смотри в /topics)")
+        await message.reply("Использование: /deltopic &lt;id темы&gt; (id смотри в /topics)")
         return
     thread_id = int(arg)
     try:
         await message.bot.delete_forum_topic(
             chat_id=message.chat.id, message_thread_id=thread_id
         )
+        deleted = True
     except Exception:
-        await message.reply("Не удалось удалить тему в Telegram (возможно, уже удалена).")
+        deleted = False
     # из базы убираем в любом случае
     for db_id, t_id, _name in await db.get_topics(message.chat.id):
         if t_id == thread_id:
             await db.delete_topic(db_id, message.chat.id)
-    await message.reply("Тема удалена.")
+    if deleted:
+        await message.reply("Тема удалена.")
+    else:
+        await message.reply(
+            "Тема удалена из базы, но в Telegram удалить не вышло "
+            "(возможно, она уже удалена или не хватает прав)."
+        )
 
 # ============================================================
 #              КОМАНДЫ ПРЕДУПРЕЖДЕНИЙ (в группах)
@@ -1495,27 +1504,6 @@ def extract_domains(text):
             pass
     return domains
 
-def _utf16_len(s: str) -> int:
-    """Длина строки в UTF-16 code units — так Telegram считает offset/length."""
-    return len(s.encode("utf-16-le")) // 2
-
-
-def build_datetime_entity(prefix: str, placeholder: str, unix_ts: int,
-                          fmt: str = "dd.MM.yyyy HH:mm"):
-    """
-    Возвращает MessageEntity типа date_time для подстроки `placeholder`,
-    которая идёт сразу после `prefix` в тексте.
-    Telegram покажет время в часовом поясе каждого пользователя.
-    """
-    from aiogram.types import MessageEntity
-    return MessageEntity(
-        type="date_time",
-        offset=_utf16_len(prefix),
-        length=_utf16_len(placeholder),
-        unix_time=unix_ts,
-        date_time_format=fmt,
-    )
-
 # Приветствие новых участников в группе
 @router.message(F.new_chat_members)
 async def on_new_member(message: Message):
@@ -1537,8 +1525,8 @@ async def on_new_member(message: Message):
         await db.save_member(chat_id, member.id, member.full_name, member.username or "")
         await send_chat_log(
             message.bot, chat_id,
-            f"➕ Новый участник: {member.full_name} | "
-            f"@{member.username or '—'} | <code>{member.id}</code>"
+            f"➕ Новый участник: {html.escape(member.full_name)} | "
+            f"@{html.escape(member.username or '—')} | <code>{member.id}</code>"
         )
 
         # Капча: ограничиваем и просим нажать кнопку
@@ -1935,7 +1923,7 @@ async def cb_last(c: CallbackQuery):
         lines = ["🕓 <b>Последние:</b>\n"]
         for fn, un, ja in rows:
             t = datetime.fromtimestamp(ja, TZ).strftime("%d.%m %H:%M")
-            lines.append(f"• {fn} (@{un or '—'}) — {t}")
+            lines.append(f"• {html.escape(fn or '')} (@{html.escape(un or '—')}) — {t}")
         text = "\n".join(lines)
     await c.message.edit_text(text, reply_markup=kb.back_kb(f"ch:{chat_id}"))
     await c.answer()
@@ -2616,6 +2604,12 @@ async def in_broadcast(message: Message, state: FSMContext):
         return
     data = await state.get_data()
     cid = data["chat_id"]
+    if not (message.text or message.caption):
+        await message.answer(
+            "Для рассылки нужен текст. Пришли текстовое сообщение "
+            "или медиа с подписью."
+        )
+        return
     await state.clear()
     text = message.html_text
     ids = await db.get_member_ids(cid)
@@ -3008,6 +3002,9 @@ async def cb_set_repeat(c: CallbackQuery, state: FSMContext):
 async def in_post_time(message: Message, state: FSMContext):
     if not is_admin_id(message.from_user.id):
         return
+    if not message.text:
+        await message.answer("Нужен текст в формате: 25.12.2026 20:00")
+        return
     try:
         dt = datetime.strptime(message.text.strip(), "%d.%m.%Y %H:%M").replace(tzinfo=TZ)
     except ValueError:
@@ -3106,7 +3103,7 @@ async def _send_post(bot, chat_id, text, btn_text, btn_url, media_type, media_id
                 media.append(InputMediaDocument(media=it["file_id"], caption=cap))
         await bot.send_media_group(chat_id, media)
         if keyboard:
-            await bot.send_message(chat_id, text or "⬆️", reply_markup=keyboard)
+            await bot.send_message(chat_id, "⬆️", reply_markup=keyboard)
     elif text:
         await bot.send_message(chat_id, text or "(пустой пост)", reply_markup=keyboard)
 

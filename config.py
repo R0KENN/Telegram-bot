@@ -6,8 +6,20 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-TIMEZONE_OFFSET = int(os.getenv("TIMEZONE_OFFSET", "3"))
+
+
+def _env_int(name, default):
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise RuntimeError(f"{name} должен быть целым числом, а не «{raw}». Проверь файл .env")
+
+
+ADMIN_ID = _env_int("ADMIN_ID", 0)
+TIMEZONE_OFFSET = _env_int("TIMEZONE_OFFSET", 3)
 
 DB_PATH = "bot.db"
 BROADCAST_PAUSE = 0.1

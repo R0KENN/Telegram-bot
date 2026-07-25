@@ -31,7 +31,7 @@ def _build_album(media_id_json, caption):
     items = json.loads(media_id_json)
     media = []
     for i, it in enumerate(items):
-        cap = caption or None if i == 0 else None
+        cap = (caption or None) if i == 0 else None
         if it["type"] == "photo":
             media.append(InputMediaPhoto(media=it["file_id"], caption=cap))
         elif it["type"] == "video":
@@ -78,18 +78,7 @@ async def backup_task(bot: Bot, interval_hours: int = 24):
         await asyncio.sleep(interval_hours * 3600)
 
 async def scheduler(bot: Bot):
-    _cleanup_counter = 0
     while True:
-        # Раз в ~сутки чистим старые завершённые посты (20с * 4320 ≈ 24ч)
-        _cleanup_counter += 1
-        if _cleanup_counter >= 4320:
-            _cleanup_counter = 0
-            try:
-                removed = await db.delete_old_posts(30)
-                if removed:
-                    logger.info("Автоочистка: удалено старых постов: %s", removed)
-            except Exception as e:
-                logger.warning("Автоочистка постов не удалась: %s", e)
         try:
             for (post_id, chat_id, text, btn_text, btn_url,
                  media_type, media_id, repeat_mode, poll_json) in await db.get_due_posts():
@@ -118,7 +107,7 @@ async def scheduler(bot: Bot):
                         sent_id = msgs[0].message_id if msgs else None
                         # У альбома не бывает инлайн-кнопки — шлём её отдельным сообщением
                         if keyboard:
-                            await bot.send_message(chat_id, text or "⬆️",
+                            await bot.send_message(chat_id, "⬆️",
                                                    reply_markup=keyboard)
                     elif text:
                         m = await bot.send_message(chat_id, text, reply_markup=keyboard)

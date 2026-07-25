@@ -3,6 +3,8 @@ from aiogram import Bot, Router
 from aiogram.types import Message
 from aiogram.exceptions import TelegramBadRequest
 
+import database as db
+
 logger = logging.getLogger(__name__)
 router = Router(name="topics")
 
@@ -19,7 +21,7 @@ async def create_topic(bot: Bot, chat_id: int, name: str,
             icon_custom_emoji_id=icon_emoji_id,
         )
         # сохраняем в БД, чтобы потом писать в эту тему
-        # db.save_topic(chat_id, topic.message_thread_id, name)
+        await db.add_topic(chat_id, topic.message_thread_id, name)
         return topic.message_thread_id
     except TelegramBadRequest as e:
         logger.error("Не удалось создать тему: %s", e)

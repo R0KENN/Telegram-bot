@@ -10,6 +10,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from config import BOT_TOKEN
 import database as db
 from handlers import router
+from topics import router as topics_router
 from scheduler import scheduler, backup_task
 from commands import setup_commands
 
@@ -37,12 +38,16 @@ async def main():
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
+    dp.include_router(topics_router)
 
     await db.init_db()
     await bot.delete_webhook(drop_pending_updates=False)
     await setup_commands(bot)
-    asyncio.create_task(scheduler(bot))
-    asyncio.create_task(backup_task(bot))
+    background_tasks = [
+        asyncio.create_task(scheduler(bot)),
+        asyncio.create_task(backup_task(bot)),
+    ]
+    dp["background_tasks"] = background_tasks
 
     logger.info("Бот запущен")
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())

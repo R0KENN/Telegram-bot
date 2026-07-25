@@ -1,5 +1,4 @@
-aiogram
+aiogram>=3.7,<4
 aiosqlite
 python-dotenv
-aiogram-sqlite-storage
 matplotlib
