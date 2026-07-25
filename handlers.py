@@ -22,10 +22,15 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.enums import ChatType, ContentType
 
-import matplotlib
-matplotlib.use("Agg")  # backend без GUI — обязательно до импорта pyplot
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
+try:
+    import matplotlib
+    matplotlib.use("Agg")  # backend без GUI — обязательно до импорта pyplot
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+except ImportError:
+    matplotlib = None
+    plt = None
+    mdates = None
 
 import database as db
 import keyboards as kb
