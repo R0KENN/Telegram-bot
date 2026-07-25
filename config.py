@@ -21,6 +21,9 @@ def _env_int(name, default):
 ADMIN_ID = _env_int("ADMIN_ID", 0)
 TIMEZONE_OFFSET = _env_int("TIMEZONE_OFFSET", 3)
 
+if not -23 <= TIMEZONE_OFFSET <= 23:
+    raise RuntimeError("TIMEZONE_OFFSET должен быть в диапазоне от -23 до 23")
+
 DB_PATH = "bot.db"
 BROADCAST_PAUSE = 0.1
 TZ = timezone(timedelta(hours=TIMEZONE_OFFSET))

@@ -57,6 +57,14 @@ _album_buffer: dict[str, dict] = {}
 # Фоновые задачи (реакции, приветствия): держим ссылки, иначе GC может убить задачу
 _bg_tasks: set = set()
 
+
+def create_background_task(coro):
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+    return task
+
+
 URL_RE = re.compile(r'(https?://[^\s]+|www\.[^\s]+|t\.me/[^\s]+|@\w+)', re.IGNORECASE)
 
 
@@ -186,8 +194,11 @@ def _format_rights_report(title, status, rights, error, chat_type):
 
 async def safe_send(bot, chat_id, text, **kwargs):
     """
-    Безопасная отправка сообщения: при флуд-лимите Telegram ждёт и повторяет один раз.
-    Возвращает True при успехе, False при провале (заблокирован, нет прав и т.п.).
+    Безопасная отправка сообщения.
+    Возвращает:
+    True — сообщение доставлено;
+    False — пользователь заблокировал бота;
+    None — временная или неизвестная ошибка.
     """
     try:
         await bot.send_message(chat_id, text, **kwargs)
@@ -198,14 +209,16 @@ async def safe_send(bot, chat_id, text, **kwargs):
         try:
             await bot.send_message(chat_id, text, **kwargs)
             return True
+        except TelegramForbiddenError:
+            return False
         except Exception as e2:
             logger.warning("Повтор отправки в %s не удался: %s", chat_id, e2)
-            return False
+            return None
     except TelegramForbiddenError:
-        return False  # пользователь заблокировал бота — это ожидаемо, не логируем
+        return False
     except Exception as e:
         logger.warning("Не удалось отправить сообщение в %s: %s", chat_id, e)
-        return False
+        return None
 
 async def send_chat_log(bot, chat_id, text, reply_markup=None):
 
@@ -706,7 +719,7 @@ async def cmd_reactall(message: Message):
         f"⏳ Запускаю перебор постов id {start_id}–{end_id} ({count} шт.). "
         f"Это займёт примерно {int(count * 0.4)} сек."
     )
-    asyncio.create_task(
+    create_background_task(
         _reactall_range_worker(message.bot, chat_id, start_id, end_id,
                                emoji, message.from_user.id)
     )
@@ -780,7 +793,7 @@ async def in_reactall_range(message: Message, state: FSMContext):
         f"Это займёт примерно {int(count * 0.4)} сек. Пришлю отчёт по завершении.",
         reply_markup=await kb.reactions_menu_kb(chat_id)
     )
-    asyncio.create_task(
+    create_background_task(
         _reactall_range_worker(message.bot, chat_id, start_id, end_id,
                                emoji, message.from_user.id)
     )
@@ -814,7 +827,7 @@ async def cb_clearall_ok(c: CallbackQuery):
         return
     _reactall_running.add(chat_id)
     await c.message.edit_text("⏳ Снимаю реакции. Пришлю отчёт по завершении.")
-    asyncio.create_task(_clearall_worker(c.bot, chat_id, c.from_user.id))
+    create_background_task(_clearall_worker(c.bot, chat_id, c.from_user.id))
     await c.answer("Запущено")
 
 # ============================================================
@@ -835,7 +848,7 @@ async def on_join_request(request: ChatJoinRequest):
         await db.save_member(chat_id, user.id, user.full_name, user.username or "")
         await notify_admin(bot, request, approved=True)
         if ctype == "channel":
-            asyncio.create_task(send_delayed_welcome(bot, chat_id, user.id))
+            create_background_task(send_delayed_welcome(bot, chat_id, user.id))
     except Exception:
         pass
 
@@ -1143,7 +1156,7 @@ async def check_flood(message: Message) -> bool:
 
     # Сбрасываем историю и снимаем флаг мута через окно времени
     _flood_tracker.pop(key, None)
-    asyncio.create_task(_clear_flood_flag(key, mute_minutes * 60))
+    create_background_task(_clear_flood_flag(key, mute_minutes * 60))
 
     await send_chat_log(
         message.bot, chat_id,
@@ -1328,12 +1341,12 @@ async def cb_warn_set_mute(c: CallbackQuery, state: FSMContext):
 async def in_warn_mute_limit(message: Message, state: FSMContext):
     if not is_admin_id(message.from_user.id):
         return
-    if not message.text.strip().isdigit() or int(message.text.strip()) < 1:
+    if not (message.text or "").strip().isdigit() or int((message.text or "").strip()) < 1:
         await message.answer("Нужно целое число не меньше 1.")
         return
     data = await state.get_data()
     cid = data["chat_id"]
-    await db.set_setting(cid, "warn_mute_limit", message.text.strip())
+    await db.set_setting(cid, "warn_mute_limit", (message.text or "").strip())
     await state.clear()
     await message.answer("✅ Порог мута обновлён.", reply_markup=await kb.warns_menu_kb(cid))
 
@@ -1355,12 +1368,12 @@ async def cb_warn_set_ban(c: CallbackQuery, state: FSMContext):
 async def in_warn_ban_limit(message: Message, state: FSMContext):
     if not is_admin_id(message.from_user.id):
         return
-    if not message.text.strip().isdigit() or int(message.text.strip()) < 1:
+    if not (message.text or "").strip().isdigit() or int((message.text or "").strip()) < 1:
         await message.answer("Нужно целое число не меньше 1.")
         return
     data = await state.get_data()
     cid = data["chat_id"]
-    new_ban = int(message.text.strip())
+    new_ban = int((message.text or "").strip())
     mute_limit = int(await db.get_setting(cid, "warn_mute_limit"))
     if new_ban <= mute_limit:
         await message.answer(
@@ -1368,7 +1381,7 @@ async def in_warn_ban_limit(message: Message, state: FSMContext):
             f"Сначала измени порог мута или введи большее число."
         )
         return
-    await db.set_setting(cid, "warn_ban_limit", message.text.strip())
+    await db.set_setting(cid, "warn_ban_limit", (message.text or "").strip())
     await state.clear()
     await message.answer("✅ Порог бана обновлён.", reply_markup=await kb.warns_menu_kb(cid))
 
@@ -1389,12 +1402,12 @@ async def cb_warn_set_minutes(c: CallbackQuery, state: FSMContext):
 async def in_warn_mute_minutes(message: Message, state: FSMContext):
     if not is_admin_id(message.from_user.id):
         return
-    if not message.text.strip().isdigit() or int(message.text.strip()) < 1:
+    if not (message.text or "").strip().isdigit() or int((message.text or "").strip()) < 1:
         await message.answer("Нужно целое число не меньше 1 (минут).")
         return
     data = await state.get_data()
     cid = data["chat_id"]
-    await db.set_setting(cid, "warn_mute_minutes", message.text.strip())
+    await db.set_setting(cid, "warn_mute_minutes", (message.text or "").strip())
     await state.clear()
     await message.answer("✅ Длительность мута обновлена.", reply_markup=await kb.warns_menu_kb(cid))
 
@@ -1440,12 +1453,12 @@ async def cb_flood_count(c: CallbackQuery, state: FSMContext):
 async def in_flood_count(message: Message, state: FSMContext):
     if not is_admin_id(message.from_user.id):
         return
-    if not message.text.strip().isdigit() or int(message.text.strip()) < 2:
+    if not (message.text or "").strip().isdigit() or int((message.text or "").strip()) < 2:
         await message.answer("Нужно целое число не меньше 2.")
         return
     data = await state.get_data()
     cid = data["chat_id"]
-    await db.set_setting(cid, "antiflood_count", message.text.strip())
+    await db.set_setting(cid, "antiflood_count", (message.text or "").strip())
     await state.clear()
     await message.answer("✅ Лимит обновлён.", reply_markup=await kb.flood_menu_kb(cid))
 
@@ -1466,12 +1479,12 @@ async def cb_flood_window(c: CallbackQuery, state: FSMContext):
 async def in_flood_window(message: Message, state: FSMContext):
     if not is_admin_id(message.from_user.id):
         return
-    if not message.text.strip().isdigit() or int(message.text.strip()) < 1:
+    if not (message.text or "").strip().isdigit() or int((message.text or "").strip()) < 1:
         await message.answer("Нужно целое число не меньше 1 (секунд).")
         return
     data = await state.get_data()
     cid = data["chat_id"]
-    await db.set_setting(cid, "antiflood_window", message.text.strip())
+    await db.set_setting(cid, "antiflood_window", (message.text or "").strip())
     await state.clear()
     await message.answer("✅ Окно обновлено.", reply_markup=await kb.flood_menu_kb(cid))
 
@@ -1492,12 +1505,12 @@ async def cb_flood_minutes(c: CallbackQuery, state: FSMContext):
 async def in_flood_minutes(message: Message, state: FSMContext):
     if not is_admin_id(message.from_user.id):
         return
-    if not message.text.strip().isdigit() or int(message.text.strip()) < 1:
+    if not (message.text or "").strip().isdigit() or int((message.text or "").strip()) < 1:
         await message.answer("Нужно целое число не меньше 1 (минут).")
         return
     data = await state.get_data()
     cid = data["chat_id"]
-    await db.set_setting(cid, "antiflood_mute_minutes", message.text.strip())
+    await db.set_setting(cid, "antiflood_mute_minutes", (message.text or "").strip())
     await state.clear()
     await message.answer("✅ Длительность мута обновлена.", reply_markup=await kb.flood_menu_kb(cid))
 
@@ -1556,7 +1569,7 @@ async def on_new_member(message: Message):
             try:
                 sent = await message.answer(text)
                 if ttl > 0:
-                    asyncio.create_task(delete_later(message.bot, chat_id, sent.message_id, ttl))
+                    create_background_task(delete_later(message.bot, chat_id, sent.message_id, ttl))
             except Exception:
                 pass
 
@@ -1600,11 +1613,35 @@ async def _start_captcha(message: Message, chat_id, member):
         )
     except Exception as e:
         logger.warning("Капча в %s: не удалось отправить сообщение: %s", chat_id, e)
+        try:
+            await bot.restrict_chat_member(
+                chat_id,
+                member.id,
+                permissions=ChatPermissions(
+                    can_send_messages=True,
+                    can_send_audios=True,
+                    can_send_documents=True,
+                    can_send_photos=True,
+                    can_send_videos=True,
+                    can_send_video_notes=True,
+                    can_send_voice_notes=True,
+                    can_send_polls=True,
+                    can_send_other_messages=True,
+                    can_add_web_page_previews=True,
+                ),
+            )
+        except Exception as restore_error:
+            logger.error(
+                "Капча в %s: не удалось вернуть права пользователю %s: %s",
+                chat_id,
+                member.id,
+                restore_error,
+            )
         return False
 
     # 3) Запоминаем и запускаем таймер
     _captcha_pending[(chat_id, member.id)] = sent.message_id
-    asyncio.create_task(_captcha_timeout(bot, chat_id, member.id, timeout))
+    create_background_task(_captcha_timeout(bot, chat_id, member.id, timeout))
     return True
 
 
@@ -1667,6 +1704,11 @@ async def cb_captcha_pass(c: CallbackQuery):
         )
     except Exception as e:
         logger.warning("Капча в %s: не удалось вернуть права %s: %s", chat_id, user_id, e)
+        await c.answer(
+            "Не удалось вернуть права. Сообщи администратору.",
+            show_alert=True,
+        )
+        return
 
     # Убираем из ожидания и удаляем сообщение капчи
     _captcha_pending.pop((chat_id, user_id), None)
@@ -1685,7 +1727,7 @@ async def cb_captcha_pass(c: CallbackQuery):
         try:
             sent = await c.bot.send_message(chat_id, text)
             if ttl > 0:
-                asyncio.create_task(delete_later(c.bot, chat_id, sent.message_id, ttl))
+                create_background_task(delete_later(c.bot, chat_id, sent.message_id, ttl))
         except Exception:
             pass
 
@@ -2223,12 +2265,12 @@ async def cb_sd(c: CallbackQuery, state: FSMContext):
 async def in_welcome_delay(message: Message, state: FSMContext):
     if not is_admin_id(message.from_user.id):
         return
-    if not message.text.strip().isdigit():
+    if not (message.text or "").strip().isdigit():
         await message.answer("Нужно число.")
         return
     data = await state.get_data()
     cid = data["chat_id"]
-    await db.set_setting(cid, "welcome_delay", message.text.strip())
+    await db.set_setting(cid, "welcome_delay", (message.text or "").strip())
     await state.clear()
     await message.answer("✅ Задержка обновлена.", reply_markup=await kb.welcome_menu_kb(cid))
 
@@ -2261,7 +2303,7 @@ async def in_wbtn_text(message: Message, state: FSMContext):
     if not message.text:
         await message.answer("Нужен текст кнопки.")
         return
-    await state.update_data(wbtn_text=message.text.strip())
+    await state.update_data(wbtn_text=(message.text or "").strip())
     await state.set_state(Form.wbtn_url)
     await message.answer("Теперь пришли ссылку (http:// или https://).")
 
@@ -2423,7 +2465,7 @@ async def in_domain(message: Message, state: FSMContext):
     if not message.text:
         await message.answer("Пришли домен текстом, например: youtube.com")
         return
-    domain = message.text.strip().lower().replace("http://", "").replace("https://", "").strip("/")
+    domain = (message.text or "").strip().lower().replace("http://", "").replace("https://", "").strip("/")
     data = await state.get_data()
     cid = data["chat_id"]
     await db.add_allowed_domain(cid, domain)
@@ -2464,9 +2506,13 @@ async def cb_addword(c: CallbackQuery, state: FSMContext):
 async def in_word(message: Message, state: FSMContext):
     if not is_admin_id(message.from_user.id):
         return
+    word = (message.text or "").strip()
+    if not word:
+        await message.answer("Пришли непустое слово текстовым сообщением.")
+        return
     data = await state.get_data()
     cid = data["chat_id"]
-    await db.add_banned_word(cid, message.text.strip())
+    await db.add_banned_word(cid, word)
     await state.clear()
     await message.answer("✅ Слово добавлено.", reply_markup=await kb.words_kb(cid))
 
@@ -2550,12 +2596,12 @@ async def cb_gwttl(c: CallbackQuery, state: FSMContext):
 async def in_gw_ttl(message: Message, state: FSMContext):
     if not is_admin_id(message.from_user.id):
         return
-    if not message.text.strip().isdigit():
+    if not (message.text or "").strip().isdigit():
         await message.answer("Нужно число.")
         return
     data = await state.get_data()
     cid = data["chat_id"]
-    await db.set_setting(cid, "group_welcome_ttl", message.text.strip())
+    await db.set_setting(cid, "group_welcome_ttl", (message.text or "").strip())
     await state.clear()
     await message.answer("✅ Обновлено.", reply_markup=await kb.group_welcome_kb(cid))
 
@@ -2610,12 +2656,12 @@ async def cb_captcha_time(c: CallbackQuery, state: FSMContext):
 async def in_captcha_time(message: Message, state: FSMContext):
     if not is_admin_id(message.from_user.id):
         return
-    if not message.text.strip().isdigit() or int(message.text.strip()) < 10:
+    if not (message.text or "").strip().isdigit() or int((message.text or "").strip()) < 10:
         await message.answer("Нужно число не меньше 10 (секунд).")
         return
     data = await state.get_data()
     cid = data["chat_id"]
-    await db.set_setting(cid, "captcha_timeout", message.text.strip())
+    await db.set_setting(cid, "captcha_timeout", (message.text or "").strip())
     await state.clear()
     await message.answer("✅ Время обновлено.", reply_markup=await kb.captcha_menu_kb(cid))
 
@@ -2656,11 +2702,13 @@ async def in_broadcast(message: Message, state: FSMContext):
     dead = []  # кто заблокировал бота — удалим из базы
     for uid in ids:
         ok = await safe_send(message.bot, uid, text)
-        if ok:
+        if ok is True:
             sent += 1
+        elif ok is False:
+            failed += 1
+            dead.append(uid)
         else:
             failed += 1
-            dead.append(uid)  # не доставили — кандидат на удаление из базы
         await asyncio.sleep(BROADCAST_PAUSE)
 
     if dead:
@@ -2809,7 +2857,7 @@ async def in_post_text(message: Message, state: FSMContext):
         # перезапускаем таймер сборки — ждём 1.5 сек после последней части
         if buf["task"]:
             buf["task"].cancel()
-        buf["task"] = asyncio.create_task(_finish_album(mgid, message))
+        buf["task"] = create_background_task(_finish_album(mgid, message))
         return
 
     # --- ОДИНОЧНОЕ МЕДИА ---
@@ -3041,7 +3089,7 @@ async def in_post_time(message: Message, state: FSMContext):
         await message.answer("Нужен текст в формате: 25.12.2026 20:00")
         return
     try:
-        dt = datetime.strptime(message.text.strip(), "%d.%m.%Y %H:%M").replace(tzinfo=TZ)
+        dt = datetime.strptime((message.text or "").strip(), "%d.%m.%Y %H:%M").replace(tzinfo=TZ)
     except ValueError:
         await message.answer("Формат: 25.12.2026 20:00")
         return
@@ -3308,7 +3356,7 @@ async def in_edit_post_time(message: Message, state: FSMContext):
         await message.answer("Нужен текст в формате: 25.12.2026 20:00")
         return
     try:
-        dt = datetime.strptime(message.text.strip(), "%d.%m.%Y %H:%M").replace(tzinfo=TZ)
+        dt = datetime.strptime((message.text or "").strip(), "%d.%m.%Y %H:%M").replace(tzinfo=TZ)
     except ValueError:
         await message.answer("Формат: 25.12.2026 20:00")
         return
